@@ -1146,7 +1146,7 @@ fn is_scheme_byte(byte: u8) -> bool {
 /// slashes and Windows backslashes are treated as separators:
 /// `/home/grokmcp/.config/nova-veil-search/auth.json` -> `auth.json`.
 pub(crate) fn redact_path(path: &str) -> String {
-    path.rsplit(|c: char| c == '/' || c == '\\')
+    path.rsplit(['/', '\\'])
         .find(|part| !part.is_empty())
         .unwrap_or(path)
         .to_string()
@@ -1388,11 +1388,11 @@ mod source_config_api_tests {
             "tavily,exa".to_string(),
         );
         let view = load_source_config(&env);
-        assert_eq!(view.env_overrides["tavily_api_key"], true);
-        assert_eq!(view.env_overrides["tavily_enabled"], true);
-        assert_eq!(view.env_overrides["source_providers"], true);
-        assert_eq!(view.env_overrides["exa_api_key"], false);
-        assert_eq!(view.env_overrides["exa_enabled"], false);
+        assert!(view.env_overrides["tavily_api_key"]);
+        assert!(view.env_overrides["tavily_enabled"]);
+        assert!(view.env_overrides["source_providers"]);
+        assert!(!view.env_overrides["exa_api_key"]);
+        assert!(!view.env_overrides["exa_enabled"]);
         assert_eq!(view.sources["tavily"].api_key, KeyStatus::Set);
         assert!(!view.sources["tavily"].enabled);
         assert_eq!(view.sources["exa"].api_key, KeyStatus::Unset);

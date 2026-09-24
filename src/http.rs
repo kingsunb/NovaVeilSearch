@@ -699,14 +699,11 @@ fn sse_stream_response(
                     }
                 }
                 result = &mut handle => {
-                    match result {
-                        Ok(Some(response)) => {
-                            let _ = tx.send(Ok(sse_message_frame(&response))).await;
-                        }
-                        // `Ok(None)` = a notification (unreachable here: the
-                        // caller only streams requests with an `id`); `Err` =
-                        // the handler task panicked. Either way just end.
-                        _ => {}
+                    // `Ok(None)` = a notification (unreachable here: the caller
+                    // only streams requests with an `id`); `Err` = the handler
+                    // task panicked. Either way just end.
+                    if let Ok(Some(response)) = result {
+                        let _ = tx.send(Ok(sse_message_frame(&response))).await;
                     }
                     break;
                 }
@@ -1064,16 +1061,13 @@ fn request_base_env(base_env: &HashMap<String, String>) -> HashMap<String, Strin
 /// Parse a boolean env flag (`1`/`true`/`yes`, case-insensitive). Absent or any
 /// other value is OFF.
 fn env_is_true(env: &HashMap<String, String>, key: &str) -> bool {
-    match env.get(key).map(|value| value.trim()) {
+    matches!(
+        env.get(key).map(|value| value.trim()),
         Some(value)
             if value.eq_ignore_ascii_case("1")
                 || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes") =>
-        {
-            true
-        }
-        _ => false,
-    }
+                || value.eq_ignore_ascii_case("yes")
+    )
 }
 
 /// Parse `GROK_MCP_ALLOWED_ORIGINS` (comma-separated) into an allowlist.
@@ -1218,7 +1212,7 @@ mod tests {
         let mut store = SessionStore::new();
         let token = store.issue(ttl);
         assert!(store.validate(&token, ttl));
-        assert!(store.validate("not-issued", ttl) == false);
+        assert!(!store.validate("not-issued", ttl));
         // Expired tokens are rejected and pruned.
         let expired = store.issue(std::time::Duration::ZERO);
         assert!(!store.validate(&expired, ttl));
