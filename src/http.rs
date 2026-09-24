@@ -25,6 +25,7 @@
 //! TLS terminates upstream (Caddy); this server binds loopback only.
 
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ use axum::{
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cache::SourceCache;
 use crate::config::Config;
@@ -54,6 +56,18 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 /// validation); excess gets 503. Bounds how many (potentially hung) blocking
 /// getaddrinfo calls can run at once.
 const MAX_DNS_LOOKUPS: usize = 8;
+
+/// Cadence (seconds) of the SSE heartbeat frames emitted while a long-running
+/// tool call is still working. The first frame goes out immediately, keeping
+/// the stream from ever being idle long enough for a fronting proxy to give
+/// up — Cloudflare's 524 fires after ~100 s with no bytes, so 15 s leaves a
+/// wide margin no matter how slow the search.
+const SSE_KEEPALIVE_SECONDS: u64 = 15;
+
+/// SSE comment frame. Comments (a line starting with `:`) are ignored by every
+/// SSE client, so a heartbeat is data on the wire without being a protocol
+/// event.
+const SSE_HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
 /// Protocol revisions the Streamable HTTP transport implements. Excludes
 /// 2024-11-05 (the deprecated HTTP+SSE transport this endpoint does not serve)
@@ -190,7 +204,7 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
     // 0. Concurrency cap FIRST — acquire the permit BEFORE buffering the body,
     //    so slow or oversized request bodies can't tie up memory/connections
     //    past the cap without ever hitting 429.
-    let _permit = match state.limiter.clone().try_acquire_owned() {
+    let permit = match state.limiter.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return (StatusCode::TOO_MANY_REQUESTS, "server at capacity").into_response(),
     };
@@ -384,14 +398,21 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
         }
     }
 
-    // 7. Dispatch through the shared, transport-agnostic handler. Respond as an
-    //    SSE stream when the client accepts text/event-stream (Streamable HTTP
-    //    streaming mode), else a single application/json body. `None` = a
-    //    notification/response with no reply -> 202 with an empty body.
-    match handle_message(&service, request).await {
-        Some(response) if wants_sse(&headers) => sse_response(&response),
-        Some(response) => (StatusCode::OK, Json(response)).into_response(),
-        None => StatusCode::ACCEPTED.into_response(),
+    // 7. Dispatch through the shared, transport-agnostic handler. A request
+    //    (has an `id`) from an SSE-accepting client is streamed: the response
+    //    starts immediately with a heartbeat, so a slow search can never leave
+    //    the connection idle long enough for Cloudflare to 524 it (the final
+    //    `event: message` frame is byte-identical to the single-shot path).
+    //    Non-SSE clients get one application/json body; notifications (`None`)
+    //    get 202 with an empty body.
+    if request.get("id").is_some() && wants_sse(&headers) {
+        sse_stream_response(service, request, permit)
+    } else {
+        match handle_message(&service, request).await {
+            Some(response) if wants_sse(&headers) => sse_response(&response),
+            Some(response) => (StatusCode::OK, Json(response)).into_response(),
+            None => StatusCode::ACCEPTED.into_response(),
+        }
     }
 }
 
@@ -407,10 +428,82 @@ fn wants_sse(headers: &HeaderMap) -> bool {
 /// per the Streamable HTTP transport: one `message` event carrying the JSON-RPC
 /// response, after which the stream ends (these tools are request/response).
 fn sse_response(response: &Value) -> Response {
-    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+    sse_headers(Response::new(axum::body::Body::from(sse_message_frame(
+        response,
+    ))))
+}
+
+/// Build a streaming SSE response that keeps the connection warm while a tool
+/// call runs, then ends on the same `message` frame as [`sse_response`]. The
+/// search runs on a spawned task; heartbeat comment frames are written once
+/// immediately and then every [`SSE_KEEPALIVE_SECONDS`], so the wire never sits
+/// silent — the exact failure mode Cloudflare turns into a 524.
+fn sse_stream_response(
+    service: SearchService,
+    request: Value,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(8);
+
+    tokio::spawn(async move {
+        // Hold the concurrency permit until the search (not just the response
+        // hand-off) is done, so streaming can't bypass MAX_CONCURRENT_REQUESTS.
+        let _permit = permit;
+
+        // Start the stream immediately: the first bytes leave before any
+        // upstream work, which is what keeps a fronting proxy from timing out.
+        if tx.send(Ok(SSE_HEARTBEAT.to_vec())).await.is_err() {
+            return; // client gone before we even started
+        }
+
+        let mut handle = tokio::spawn(async move { handle_message(&service, request).await });
+
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SSE_KEEPALIVE_SECONDS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first interval tick fires immediately; skip it, since the initial
+        // heartbeat above already put bytes on the wire.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if tx.send(Ok(SSE_HEARTBEAT.to_vec())).await.is_err() {
+                        break; // client disconnected mid-search
+                    }
+                }
+                result = &mut handle => {
+                    match result {
+                        Ok(Some(response)) => {
+                            let _ = tx.send(Ok(sse_message_frame(&response))).await;
+                        }
+                        // `Ok(None)` = a notification (unreachable here: the
+                        // caller only streams requests with an `id`); `Err` =
+                        // the handler task panicked. Either way just end.
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+        }
+        // `tx` drops here -> the body stream ends -> the connection closes.
+    });
+
+    sse_headers(Response::new(axum::body::Body::from_stream(
+        ReceiverStream::new(rx),
+    )))
+}
+
+/// The `message` event frame carrying one JSON-RPC response — shared verbatim
+/// by the single-shot and streaming SSE paths.
+fn sse_message_frame(response: &Value) -> Vec<u8> {
     let data = serde_json::to_string(response).unwrap_or_else(|_| "{}".to_string());
-    let body = format!("event: message\ndata: {data}\n\n");
-    let mut resp = Response::new(axum::body::Body::from(body));
+    format!("event: message\ndata: {data}\n\n").into_bytes()
+}
+
+/// Shared SSE response headers (`text/event-stream`, `no-cache`).
+fn sse_headers(mut resp: Response) -> Response {
+    use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     resp.headers_mut().insert(
         CONTENT_TYPE,
         axum::http::HeaderValue::from_static("text/event-stream"),
@@ -1076,6 +1169,39 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.starts_with("event: message\ndata: "));
         assert!(text.ends_with("\n\n"));
+        assert!(text.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[tokio::test]
+    async fn sse_stream_emits_keepalive_then_final_message() {
+        let service = SearchService::fake_with_sources();
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = sem.clone().try_acquire_owned().unwrap();
+        let resp = sse_stream_response(
+            service,
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+            permit,
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "text/event-stream"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        // The first heartbeat is sent before any search work, so it is always
+        // present even when the request resolves instantly.
+        assert!(
+            text.contains(": keep-alive"),
+            "stream must start with a keepalive frame: {text:?}"
+        );
+        assert!(
+            text.contains("event: message"),
+            "stream must end with the JSON-RPC message frame: {text:?}"
+        );
         assert!(text.contains("\"jsonrpc\":\"2.0\""));
     }
 }
