@@ -355,16 +355,6 @@ More docs:
  </picture>
 </a>
 
----
-
-## Acknowledgements
-
-- Special thanks to the upstream project [Episkey-G/GrokSearch-rs](https://github.com/Episkey-G/GrokSearch-rs) — this project
-  `NovaVeilSearch` is forked from and renamed after it. Its clean, well-tested Rust MCP architecture and its MIT license made
-  this fork possible; we are grateful to the original author(s) for their work.
-- Inspired by [GuDaStudio/GrokSearch](https://github.com/GuDaStudio/GrokSearch) — the original Python implementation that pioneered the Grok + Tavily + Firecrawl combo this project rewrites in Rust.
-- Thanks to the [LinuxDo](https://linux.do) community for the discussions, feedback, and the prior art that inspired this rewrite.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
