@@ -115,9 +115,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
-          # latest=auto is the default: metadata-action adds `:latest` on push to
-          # the default branch (main), alongside `:main` and `:sha-<short>`.
           tags: |
+            type=raw,value=latest
             type=ref,event=branch
             type=sha,format=short,prefix=sha-
 
