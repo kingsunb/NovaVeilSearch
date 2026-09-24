@@ -8,13 +8,10 @@
 #
 # Endpoint: https://<MCP_HOSTNAME>/nova-veil-search/mcp
 #
-# Two credential modes, picked by whether GROK_MCP_API_TOKEN is set:
-#   • server-config (GROK_MCP_API_TOKEN set — the default for a shared instance):
-#     put the provider keys HERE; every client connects with only
-#     `Authorization: Bearer <token>`. No per-client keys.
-#   • bring-your-own-key (token unset/empty): leave all *_API_KEY blank here and
-#     each client sends its own keys as X-*-Api-Key request headers (the server
-#     strips any server-side keys in this mode).
+# Credentials are ALWAYS server-side (built-in): put the provider keys HERE and
+# every request runs on them; callers never supply their own keys. Every request
+# must authenticate with `Authorization: Bearer <token>` — either GROK_MCP_API_TOKEN
+# or a session token issued by POST /login (see NOVA_ADMIN_* below).
 services:
   nova-veil-search:
     build: .
@@ -25,6 +22,14 @@ services:
       # Server-config mode: a shared token + server-held provider keys.
       # Set a long random token and fill the keys you use.
       GROK_MCP_API_TOKEN: "${GROK_MCP_API_TOKEN:-change-me-to-a-long-random-token}"
+      # Web UI login for the settings/config frontend (POST /login -> session token).
+      NOVA_ADMIN_USER: "${NOVA_ADMIN_USER:-admin}"
+      NOVA_ADMIN_PASSWORD: "${NOVA_ADMIN_PASSWORD:-}"
+      NOVA_SESSION_TTL_SECONDS: "${NOVA_SESSION_TTL_SECONDS:-43200}"
+      # Settings/config frontend (GET / + /api/config) — opt-in, OFF by default.
+      # Uncomment to serve the embedded settings SPA. OFF = pure backend, no
+      # frontend routes, no per-request config.toml read.
+      # NOVA_CONFIG_UI: "true"
       GROK_SEARCH_API_KEY: "${GROK_SEARCH_API_KEY:-}"
       TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
       # Optional extra source providers: uncomment and fill as needed.
@@ -35,8 +40,7 @@ services:
       # Operator-fixed gateway/model defaults (optional).
       # GROK_SEARCH_URL: "https://api.x.ai"
       # GROK_SEARCH_MODEL: "grok-4-1-fast-reasoning"
-      # To serve BYOK instead, clear GROK_MCP_API_TOKEN above and leave every
-      # *_API_KEY value empty.
+      # Keys are always server-side here; callers never supply their own.
     expose:
       - "8080"
     mem_limit: 256m

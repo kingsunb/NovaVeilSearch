@@ -12,3 +12,5 @@ pub mod oauth;
 pub mod providers;
 pub mod service;
 pub mod sources;
+#[cfg(feature = "http")]
+pub mod web;

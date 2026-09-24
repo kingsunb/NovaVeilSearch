@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nova Veil Search — Settings</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b21;
+    --panel-2: #1f232b;
+    --border: #2a2f3a;
+    --text: #e6e8ee;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --danger: #ff5c5c;
+    --ok: #3ecf8e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 32px 20px 64px;
+  }
+  h1 { font-size: 22px; font-weight: 600; }
+  h2 { font-size: 16px; font-weight: 600; color: var(--muted); margin: 28px 0 10px; text-transform: uppercase; letter-spacing: .04em; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  label { display: block; }
+  input[type="text"], input[type="password"] {
+    width: 100%;
+    margin: 6px 0 14px;
+    padding: 9px 11px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    font: inherit;
+  }
+  input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); vertical-align: -3px; }
+  button {
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 7px;
+    padding: 8px 14px;
+    font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  button.mini { padding: 4px 9px; margin-left: 6px; font-size: 13px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  [role="alert"] { color: var(--danger); min-height: 1.2em; margin-top: 8px; }
+  [role="status"] { color: var(--ok); min-height: 1.2em; margin: 10px 0 0; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px 12px;
+  }
+  .card .head { font-weight: 600; display: flex; align-items: center; }
+  .card .head input { margin-right: 8px; }
+  .badge {
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+    margin-left: 8px;
+  }
+  .badge.env { color: var(--accent); border-color: var(--accent); }
+  .status {
+    color: var(--muted); font-size: 13px; align-self: center;
+  }
+  .status.set { color: var(--ok); }
+  .status.unset { color: var(--muted); }
+  .status.env { color: var(--accent); }
+  .status.clear { color: var(--danger); }
+  .card .key { margin: 0; grid-column: 1 / -1; }
+  .card .actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+
+  ol#source-order { padding-left: 22px; }
+  ol#source-order li { margin: 7px 0; display: flex; align-items: center; }
+  .chip {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 12px; margin-right: 8px; font-weight: 500;
+  }
+  #order-add { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .foot { margin-top: 28px; color: var(--muted); font-size: 13px; }
+  .foot code { color: var(--text); }
+</style>
+</head>
+<body>
+  <main id="view-login" hidden>
+    <h1>Nova Veil Search — Settings</h1>
+    <div class="panel">
+      <form id="login-form">
+        <label>Username
+          <input id="username" autocomplete="username" autofocus>
+        </label>
+        <label>Password
+          <input id="password" type="password" autocomplete="current-password">
+        </label>
+        <button type="submit" class="primary">Log in</button>
+        <p id="login-error" role="alert"></p>
+      </form>
+    </div>
+  </main>
+
+  <main id="view-settings" hidden>
+    <h1>Search sources</h1>
+    <div id="sources"></div>
+
+    <h2>Source order</h2>
+    <div class="panel">
+      <ol id="source-order"></ol>
+      <div id="order-add"></div>
+      <p class="foot">The chain is tried in this order. Sources omitted from the list are not queried.</p>
+    </div>
+
+    <p>
+      <button id="save" class="primary">Save</button>
+    </p>
+    <p id="save-status" role="status"></p>
+
+    <div class="foot" id="config-file-note"></div>
+    <p>
+      <button id="logout">Log out</button>
+    </p>
+  </main>
+
+<script>
+  'use strict';
+
+  // Relative URLs resolve under the Caddy path prefix (e.g. /nova-veil-search/).
+  const API = { login: 'login', config: 'api/config' };
+  const TOKEN_KEY = 'nv_token';
+  const SOURCE_META = [
+    { id: 'tavily',    label: 'Tavily' },
+    { id: 'exa',       label: 'Exa' },
+    { id: 'tinyfish',  label: 'TinyFish' },
+    { id: 'firecrawl', label: 'Firecrawl' },
+  ];
+
+  let current = null;      // last GET /api/config payload
+  let orderState = [];     // editable source_providers order
+  let clearFlags = {};     // source id -> true when "Clear key" pressed
+
+  function token() {
+    return sessionStorage.getItem(TOKEN_KEY);
+  }
+
+  function showLogin() {
+    document.getElementById('view-settings').hidden = true;
+    document.getElementById('view-login').hidden = false;
+    sessionStorage.removeItem(TOKEN_KEY);
+    current = null;
+    orderState = [];
+    clearFlags = {};
+  }
+
+  function showSettings() {
+    document.getElementById('view-login').hidden = true;
+    document.getElementById('view-settings').hidden = false;
+  }
+
+  function setStatus(text) {
+    document.getElementById('save-status').textContent = text;
+  }
+
+  async function login(e) {
+    e.preventDefault();
+    const errorEl = document.getElementById('login-error');
+    errorEl.textContent = '';
+    const username = document.getElementById('username').value;
+    const password = document.getElementById('password').value;
+    let resp;
+    try {
+      resp = await fetch(API.login, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+    } catch (err) {
+      errorEl.textContent = 'Network error: ' + err;
+      return;
+    }
+    if (resp.status === 200) {
+      const data = await resp.json();
+      sessionStorage.setItem(TOKEN_KEY, data.token);
+      await loadConfig();
+    } else if (resp.status === 404) {
+      errorEl.textContent = 'Admin login is not enabled (set NOVA_ADMIN_PASSWORD).';
+    } else {
+      errorEl.textContent = 'Invalid credentials.';
+    }
+  }
+
+  async function loadConfig() {
+    const t = token();
+    if (!t) { showLogin(); return; }
+    let resp;
+    try {
+      resp = await fetch(API.config, { headers: { 'Authorization': 'Bearer ' + t } });
+    } catch (err) {
+      showLogin();
+      return;
+    }
+    if (resp.status === 200) {
+      const data = await resp.json();
+      renderSettings(data);
+      showSettings();
+      setStatus('');
+    } else {
+      showLogin();
+    }
+  }
+
+  function sourceMeta(id) {
+    return SOURCE_META.find(function (s) { return s.id === id; });
+  }
+
+  function statusText(id) {
+    const data = current;
+    const src = data.sources[id];
+    const keyOver = data.env_overrides[id + '_api_key'];
+    if (keyOver) return 'env';
+    if (clearFlags[id]) return 'clear';
+    return src.api_key === 'set' ? 'set' : 'unset';
+  }
+
+  function updateStatus(id) {
+    const el = document.getElementById('status-' + id);
+    if (!el) return;
+    const text = statusText(id);
+    el.textContent = text;
+    el.className = 'status ' + text;
+  }
+
+  function renderSettings(data) {
+    current = data;
+    orderState = data.source_providers.slice();
+    clearFlags = {};
+    const sourcesEl = document.getElementById('sources');
+    sourcesEl.innerHTML = '';
+
+    for (const s of SOURCE_META) {
+      const src = data.sources[s.id];
+      const enabledOver = data.env_overrides[s.id + '_enabled'];
+      const keyOver = data.env_overrides[s.id + '_api_key'];
+
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.id = 'card-' + s.id;
+
+      const head = document.createElement('div');
+      head.className = 'head';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'enabled';
+      cb.checked = src.enabled;
+      cb.disabled = enabledOver;
+      head.appendChild(cb);
+      const label = document.createElement('span');
+      label.textContent = s.label;
+      head.appendChild(label);
+      if (enabledOver || keyOver) {
+        const badge = document.createElement('span');
+        badge.className = 'badge env';
+        badge.textContent = 'env';
+        head.appendChild(badge);
+      }
+      card.appendChild(head);
+
+      const keyInput = document.createElement('input');
+      keyInput.type = 'password';
+      keyInput.className = 'key';
+      keyInput.autocomplete = 'off';
+      keyInput.placeholder = src.api_key === 'set' ? '••••••••' : '';
+      keyInput.disabled = keyOver;
+      card.appendChild(keyInput);
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      const status = document.createElement('span');
+      status.className = 'status';
+      status.id = 'status-' + s.id;
+      actions.appendChild(status);
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'mini';
+      clearBtn.textContent = 'Clear key';
+      clearBtn.disabled = keyOver;
+      clearBtn.addEventListener('click', function () {
+        clearFlags[s.id] = true;
+        keyInput.value = '';
+        keyInput.placeholder = '';
+        updateStatus(s.id);
+      });
+      actions.appendChild(clearBtn);
+      card.appendChild(actions);
+
+      sourcesEl.appendChild(card);
+      updateStatus(s.id);
+    }
+
+    renderOrder();
+    const note = document.getElementById('config-file-note');
+    if (data.config_file) {
+      note.textContent = 'Config: ' + data.config_file + ' (' + data.config_file_state + ').';
+    } else {
+      note.textContent = 'No config file resolved (state: ' + data.config_file_state + ').';
+    }
+  }
+
+  function miniButton(text, onClick, disabled) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mini';
+    b.textContent = text;
+    b.disabled = !!disabled;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function renderOrder() {
+    const locked = current.env_overrides.source_providers;
+    const ol = document.getElementById('source-order');
+    ol.innerHTML = '';
+
+    orderState.forEach(function (name, i) {
+      const li = document.createElement('li');
+      const chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = name;
+      li.appendChild(chip);
+
+      li.appendChild(miniButton('↑', function () {
+        if (i === 0) return;
+        const tmp = orderState[i - 1]; orderState[i - 1] = orderState[i]; orderState[i] = tmp;
+        renderOrder();
+      }, locked || i === 0));
+
+      li.appendChild(miniButton('↓', function () {
+        if (i === orderState.length - 1) return;
+        const tmp = orderState[i + 1]; orderState[i + 1] = orderState[i]; orderState[i] = tmp;
+        renderOrder();
+      }, locked || i === orderState.length - 1));
+
+      li.appendChild(miniButton('×', function () {
+        orderState.splice(i, 1);
+        renderOrder();
+      }, locked));
+
+      ol.appendChild(li);
+    });
+
+    const add = document.getElementById('order-add');
+    add.innerHTML = '';
+    const present = new Set(orderState);
+    for (const s of SOURCE_META) {
+      if (!present.has(s.id)) {
+        add.appendChild(miniButton('+ ' + s.label, function () {
+          orderState.push(s.id);
+          renderOrder();
+        }, locked));
+      }
+    }
+    if (orderState.length === 0) {
+      const empty = document.createElement('span');
+      empty.className = 'foot';
+      empty.textContent = ' (built-in order)';
+      ol.appendChild(empty);
+    }
+  }
+
+  async function save() {
+    const body = {};
+    for (const s of SOURCE_META) {
+      const enabledField = s.id + '_enabled';
+      if (!current.env_overrides[enabledField]) {
+        body[enabledField] = document.querySelector('#card-' + s.id + ' .enabled').checked;
+      }
+      const keyInput = document.querySelector('#card-' + s.id + ' .key');
+      if (!current.env_overrides[s.id + '_api_key']) {
+        if (clearFlags[s.id]) {
+          body[s.id + '_api_key'] = '';
+        } else {
+          const v = keyInput.value.trim();
+          if (v) body[s.id + '_api_key'] = v;
+        }
+      }
+    }
+    if (!current.env_overrides.source_providers) {
+      body.source_providers = orderState.slice();
+    }
+
+    setStatus('Saving…');
+    let resp;
+    try {
+      resp = await fetch(API.config, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token(),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      setStatus('Save failed: ' + err);
+      return;
+    }
+
+    if (resp.status === 200) {
+      const data = await resp.json();
+      renderSettings(data);
+      setStatus('Saved');
+    } else if (resp.status === 400) {
+      let message = 'Validation failed';
+      try {
+        const data = await resp.json();
+        if (data.errors && data.errors.length) {
+          message = data.errors.map(function (e) { return e.message; }).join('; ');
+        }
+      } catch (e) { /* keep default */ }
+      setStatus(message);
+    } else if (resp.status === 401 || resp.status === 403) {
+      showLogin();
+    } else {
+      setStatus('Save failed (' + resp.status + ')');
+    }
+  }
+
+  function logout() {
+    sessionStorage.removeItem(TOKEN_KEY);
+    showLogin();
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    document.getElementById('login-form').addEventListener('submit', login);
+    document.getElementById('save').addEventListener('click', save);
+    document.getElementById('logout').addEventListener('click', logout);
+    if (token()) {
+      loadConfig();
+    } else {
+      showLogin();
+    }
+  });
+</script>
+</body>
+</html>

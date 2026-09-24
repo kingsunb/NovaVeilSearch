@@ -15,7 +15,7 @@
 - 🧩 **Structured `web_fetch`** — GitHub issues/PRs/releases, StackExchange/MathOverflow, arXiv, and Wikipedia URLs are parsed by specialist extractors into clean Markdown (title, state/labels, release notes, accepted‑answer ordering, abstracts, vote‑sorted answers). **Specialist extractors need no API key.** Anything else falls back to the generic source chain (Tavily → Exa → TinyFish → Firecrawl, as configured) — so with **no source provider configured, ordinary URLs cannot be fetched at all**, only the specialist families above. Output carries `source_type` and a `fallback_reason` when a specialist was skipped.
 - 🔀 **Two transports** — native xAI Responses (`/v1/responses`) **or** any OpenAI‑compatible chat‑completions gateway (`/v1/chat/completions`). Pick by env vars; no flag.
 - 🔐 **Optional Grok OAuth mode** — `login/status/logout` commands store a local xAI OAuth token for Responses auth, so the MCP server can run without `GROK_SEARCH_API_KEY`.
-- 🌐 **Optional remote mode** — build with `--features http` to serve the same tools over **Streamable HTTP** (multi‑tenant, bring‑your‑own‑key via request headers) for mobile / multi‑device access. See [self-hosting](#self-hosting-remote-http).
+- 🌐 **Optional remote mode** — build with `--features http` to serve the same tools over **Streamable HTTP** (server-held keys, bearer-token auth + optional `/login` session tokens) for mobile / multi‑device access. See [self-hosting](#self-hosting-remote-http).
 - 📥 **Pluggable source chain** — supplemental sources and generic fetch walk an ordered provider chain: **Tavily** (RAG‑tuned search + extract + map), **Exa** (semantic search, native domain/date filters), **TinyFish** (free search + JS‑rendering fetch), **Firecrawl** (robust scrape fallback). First provider with results wins; `GROK_SEARCH_SOURCE_PROVIDERS` reorders. `TAVILY_API_KEY` accepts a comma‑separated key list — keys rotate round‑robin with automatic failover on rate/quota errors.
 - 🐦 **Optional X/Twitter search** via `x_search` (Responses transport only).
 - 🚦 **Concurrent stdio requests** — up to 8 tool calls are handled at once; anything beyond that queues rather than being refused. Responses come back in completion order, paired to requests by JSON‑RPC `id`.
@@ -95,20 +95,20 @@ Run locally over stdio:
 The MCP **transport** decides how config reaches the server — same values, different channel (forced by the transport, not a project setting):
 
 - **stdio (local):** environment variables — the `env` block in your MCP client config.
-- **remote HTTP:** per-request HTTP headers — the server stores no keys.
+- **remote HTTP:** the server's own environment — caller requests never carry keys.
 
-| Setting | stdio env | remote header |
-|---|---|---|
-| Grok API key | `GROK_SEARCH_API_KEY` | `X-Grok-Api-Key` |
-| Grok gateway URL | `GROK_SEARCH_URL` | `X-Grok-Base-Url` |
-| Grok model | `GROK_SEARCH_MODEL` | `X-Grok-Model` |
-| Tavily API key | `TAVILY_API_KEY` | `X-Tavily-Api-Key` |
-| Firecrawl API key | `FIRECRAWL_API_KEY` | `X-Firecrawl-Api-Key` |
-| TinyFish API key | `TINYFISH_API_KEY` | `X-Tinyfish-Api-Key` |
-| Exa API key | `EXA_API_KEY` | `X-Exa-Api-Key` |
-| GitHub token | `GITHUB_TOKEN` | `X-GitHub-Token` |
+| Setting | env key |
+|---|---|
+| Grok API key | `GROK_SEARCH_API_KEY` |
+| Grok gateway URL | `GROK_SEARCH_URL` |
+| Grok model | `GROK_SEARCH_MODEL` |
+| Tavily API key | `TAVILY_API_KEY` |
+| Firecrawl API key | `FIRECRAWL_API_KEY` |
+| TinyFish API key | `TINYFISH_API_KEY` |
+| Exa API key | `EXA_API_KEY` |
+| GitHub token | `GITHUB_TOKEN` |
 
-The tables below use env-key names (they also drive `config.toml` / stdio); on the remote transport send the header from the row above. Full reference and per-transport examples: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#configuration-channels-stdio-env-vs-remote-headers). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports.
+The tables below use env-key names (they also drive `config.toml` / stdio). Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports.
 
 ### A. Native Grok Responses (default)
 
@@ -235,38 +235,42 @@ Streamable HTTP MCP server** so mobile / on‑the‑go / multi‑device clients 
 the network. It is **opt‑in behind the `http` Cargo feature** — the default build is
 unchanged (pure stdio, no HTTP dependencies linked in).
 
-**One shared token, server-held keys (server-config mode).** Set `GROK_MCP_API_TOKEN` to a
+**Server-held keys, bearer-token auth (the only mode).** Set `GROK_MCP_API_TOKEN` (required) to a
 long random string and put the provider keys in the **server's** own environment (compose
-file, `.env`, systemd unit). Every request must then authenticate with a single
-`Authorization: Bearer <token>` header, and authenticated requests run on the server's keys —
-clients carry no keys of their own:
+file, `.env`, systemd unit). Keys are always built‑in: caller requests never carry their own
+keys or gateway/model overrides. Every request must authenticate with an
+`Authorization: Bearer <token>` header — either the master `GROK_MCP_API_TOKEN` or a session
+token issued by the login endpoint:
 
 ```bash
 claude mcp add --transport http nova-veil-search https://<your-host>/nova-veil-search/mcp \
   --header "Authorization: Bearer <token>"
 ```
 
-A caller-supplied `X-*-Api-Key` header still overrides the server key for that request, so a
-trusted power user can opt out of the shared pool. Leave `GROK_MCP_API_TOKEN` unset to stay in
-the mode below.
+**Login endpoint for a settings/config frontend.** Set `NOVA_ADMIN_PASSWORD`
+(`NOVA_ADMIN_USER`, default `admin`) to enable `POST /login`, which verifies the admin
+credentials and returns a short-lived session token (`NOVA_SESSION_TTL_SECONDS`, default
+43200 = 12 h, sliding expiry) the web UI then sends on `/mcp` calls. Leave
+`NOVA_ADMIN_PASSWORD` unset and `/login` responds `404`.
 
-**Bring‑your‑own‑key, zero shared credentials (default).** The server stores no API keys. Each
-request carries the caller's own keys as headers, so many users can share one endpoint and
-each pays with their own keys:
+```bash
+curl -sX POST https://<your-host>/nova-veil-search/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<NOVA_ADMIN_PASSWORD>"}'
+# => {"token":"<uuid>","expires_in_seconds":43200}
+```
 
-- `X-Grok-Api-Key`, `X-Tavily-Api-Key`, `X-Firecrawl-Api-Key` (optional `X-GitHub-Token`)
-- Optional non‑secret overrides: `X-Grok-Base-Url` (gateway), `X-Grok-Model` (model name, since model ids are gateway‑specific)
-
-In this mode, setting `TAVILY_API_KEY` / `FIRECRAWL_API_KEY` in the **server's** own
-environment has no effect — those are stripped from every per‑request config, so requests that
-don't carry the header run with no source fallback at all. The server logs a warning at
-startup for each such variable it finds.
+**Opt-in settings/config frontend (`NOVA_CONFIG_UI`).** `GET /` and `GET/PUT
+`/api/config` are **off by default**: the server stays a pure backend (`/mcp`,
+`/messages`, `/login`) with no frontend routes and no per-request `config.toml`
+read. Set `NOVA_CONFIG_UI=true` (also `1`/`yes`, case-insensitive) to serve the
+embedded settings SPA and let each request honor `config.toml` edits (env
+> file > defaults). Off, `/` and `/api/config` return `404`.
 
 A missing required key returns `401` (fail‑closed); OAuth is rejected on this transport
-(stdio only). The operator sets the default Grok‑compatible gateway via `GROK_SEARCH_URL`
-(default `https://api.x.ai`), and callers may point at any other Grok‑compatible gateway with an
-`X-Grok-Base-Url` header (any public gateway is honored; internal/private addresses are rejected).
-The remote transport uses the Grok **Responses** API only; the OpenAI-compatible chat-completions transport is stdio-only.
+(stdio only). The operator sets the Grok‑compatible gateway via `GROK_SEARCH_URL`
+(default `https://api.x.ai`). The remote transport uses the Grok **Responses** API only; the
+OpenAI-compatible chat-completions transport is stdio-only.
 
 **No local build needed.** Every release ships ready‑to‑run server artifacts for Linux
 `x86_64` + `aarch64` (static musl) — ideal for low‑RAM/small‑disk boards where a native
@@ -293,25 +297,17 @@ for a one‑command deploy with automatic HTTPS. Set `MCP_HOSTNAME` (your domain
 `<dashed-ip>.sslip.io` name) via the environment or a git‑ignored `.env` — **not** in the
 repo.
 
-Connect a client over Streamable HTTP with the `Authorization: Bearer <token>` header (server-config
-mode, [Quick Start](#quick-start) shows the stdio setup; the header example is [above](#self-hosting-remote-http)),
+Connect a client over Streamable HTTP with the `Authorization: Bearer <token>` header
+([Quick Start](#quick-start) shows the stdio setup; the header example is [above](#self-hosting-remote-http)),
 pointing `url` at your own host (`https://<your-host>/nova-veil-search/mcp`).
 
 ### Rotating a key
 
-Rotation depends on the mode:
-
-- **server-config mode** — keys live on the server, so rotate there (update the provider key
-  in the server environment). Rotate `GROK_MCP_API_TOKEN` itself whenever it has leaked; every
-  client then updates only its `Authorization` header.
-- **bring-your-own-key mode** — keys live on the client. For stdio, update the key in your MCP
-  client's `env` block (or the global `config.toml`) and restart the client. For remote HTTP,
-  update the header value in your client config. For Claude Code:
-  ```bash
-  claude mcp remove nova-veil-search -s user
-  claude mcp add --transport http nova-veil-search https://<your-host>/nova-veil-search/mcp \
-    --header "X-Grok-Api-Key: <new-key>" --header "X-Tavily-Api-Key: <new-key>"
-  ```
+Keys live on the server, so rotate there (update the provider key in the server environment).
+Rotate `GROK_MCP_API_TOKEN` whenever it has leaked — every client then updates only its
+`Authorization` header; previously issued `/login` session tokens also stop matching the master
+token but any still-valid sessions must be cleared by restarting the server (sessions are
+in-memory).
 
 Rotate immediately if a key was ever printed, logged, or shared.
 

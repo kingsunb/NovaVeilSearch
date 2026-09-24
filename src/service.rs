@@ -388,24 +388,10 @@ struct ProviderSet {
 }
 
 /// Build the credential-bearing providers for a given `config`, reusing the
-/// caller-supplied shared `http` client. Extracted verbatim from the original
-/// `SearchService::new` body so both the process-wide (stdio) and per-request
-/// (HTTP) construction paths share one implementation.
+/// shared `http` client. Extracted from the original `SearchService::new`
+/// body so both the process-wide (stdio) and per-request (HTTP) construction
+/// paths share one implementation.
 fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSet> {
-    build_providers_with_grok(config, http, http)
-}
-
-/// Like [`build_providers`], but the Grok **Responses** provider uses
-/// `grok_http` while every other provider (Tavily / Firecrawl / source
-/// fetching) keeps `http`. The HTTP transport passes a DNS-pinned,
-/// no-redirect client as `grok_http` for a caller-supplied gateway
-/// (`X-Grok-Base-Url`) — that restriction must apply to the gateway request
-/// only, not to unrelated fetch/search traffic.
-fn build_providers_with_grok(
-    config: &Config,
-    http: &reqwest::Client,
-    grok_http: &reqwest::Client,
-) -> Result<ProviderSet> {
     use crate::config::Transport;
 
     let ai: Arc<dyn AiProvider> = match config.transport {
@@ -433,7 +419,7 @@ fn build_providers_with_grok(
                     }
                 };
             Arc::new(GrokResponsesProvider::with_credential_client(
-                grok_http.clone(),
+                http.clone(),
                 config.grok_api_url.clone(),
                 credential,
                 config.web_search_enabled,
@@ -530,40 +516,23 @@ impl SearchService {
 
     /// Build a request-scoped service from shared state — a reused HTTP client
     /// and the process-wide source cache — plus a per-request `config`. This is
-    /// the entrypoint the HTTP transport uses: the server process holds no
-    /// credentials of its own, so it keeps only the shared client + cache and
-    /// constructs a fully-credentialed service per request from the caller's
-    /// header keys. OAuth is rejected here (single on-disk identity is
-    /// incompatible with per-request multi-tenancy); a missing required key
-    /// fails at construction (fail-closed) rather than reusing any server key.
+    /// the entrypoint the HTTP transport uses: the server holds the credentials,
+    /// authenticates the request, then constructs a fully-credentialed service
+    /// per request from the server's own keys. OAuth is rejected here (single
+    /// on-disk identity is incompatible with a shared server); a missing
+    /// required key fails at construction (fail-closed).
     pub fn for_request(
         http_client: reqwest::Client,
         cache: Arc<Mutex<SourceCache>>,
         config: Config,
     ) -> Result<Self> {
-        Self::for_request_with_grok_client(http_client.clone(), http_client, cache, config)
-    }
-
-    /// Like [`for_request`], but the Grok provider uses `grok_client` while all
-    /// other providers keep `http_client`. The HTTP transport passes a
-    /// DNS-pinned, no-redirect client here for a caller-supplied gateway, so
-    /// the pin/no-redirect restriction stays scoped to the gateway request and
-    /// never degrades unrelated fetch/search redirect handling.
-    ///
-    /// [`for_request`]: SearchService::for_request
-    pub fn for_request_with_grok_client(
-        http_client: reqwest::Client,
-        grok_client: reqwest::Client,
-        cache: Arc<Mutex<SourceCache>>,
-        config: Config,
-    ) -> Result<Self> {
         if config.grok_auth_mode == AuthMode::OAuth {
             return Err(NovaVeilSearchError::OAuth(
-                "oauth is not supported on the HTTP transport; pass a per-request API key"
+                "oauth is not supported on the HTTP transport; configure a server-side API key"
                     .to_string(),
             ));
         }
-        let providers = build_providers_with_grok(&config, &http_client, &grok_client)?;
+        let providers = build_providers(&config, &http_client)?;
         Ok(Self::from_parts(config, http_client, cache, providers))
     }
 
@@ -1269,7 +1238,7 @@ impl SearchService {
             "provider": provider_label,
             "transport": provider_label,
             "grok": {
-                "api_url": ai_api_url,
+                "api_url": crate::config::redact_url(ai_api_url),
                 "model": self.default_model,
                 "auth_mode": match self.config.grok_auth_mode {
                     AuthMode::ApiKey => "api_key",
@@ -1279,7 +1248,7 @@ impl SearchService {
                     .grok_auth_file
                     .clone()
                     .or_else(crate::config::auth_path)
-                    .map(|path| path.display().to_string())
+                    .map(|path| crate::config::redact_path(&path.display().to_string()))
                     .unwrap_or_else(|| "unavailable".to_string()),
                 "web_search_enabled": self.config.web_search_enabled,
                 "x_search_enabled": ai_x_search_enabled,
@@ -1287,26 +1256,26 @@ impl SearchService {
                 "detail": grok_probe.detail,
             },
             "tavily": {
-                "api_url": self.config.tavily_api_url,
+                "api_url": crate::config::redact_url(&self.config.tavily_api_url),
                 "enabled": self.config.tavily_enabled,
                 "reachable": tavily_probe.ok,
                 "detail": tavily_probe.detail,
             },
             "exa": {
-                "api_url": self.config.exa_api_url,
+                "api_url": crate::config::redact_url(&self.config.exa_api_url),
                 "enabled": self.config.exa_enabled,
                 "reachable": exa_probe.ok,
                 "detail": exa_probe.detail,
             },
             "tinyfish": {
-                "search_api_url": self.config.tinyfish_search_api_url,
-                "fetch_api_url": self.config.tinyfish_fetch_api_url,
+                "search_api_url": crate::config::redact_url(&self.config.tinyfish_search_api_url),
+                "fetch_api_url": crate::config::redact_url(&self.config.tinyfish_fetch_api_url),
                 "enabled": self.config.tinyfish_enabled,
                 "reachable": tinyfish_probe.ok,
                 "detail": tinyfish_probe.detail,
             },
             "firecrawl": {
-                "api_url": self.config.firecrawl_api_url,
+                "api_url": crate::config::redact_url(&self.config.firecrawl_api_url),
                 "enabled": self.config.firecrawl_enabled,
                 "reachable": firecrawl_probe.ok,
                 "detail": firecrawl_probe.detail,
@@ -1321,7 +1290,7 @@ impl SearchService {
                 "path": self.config
                     .config_file_path
                     .as_ref()
-                    .map(|path| path.display().to_string()),
+                    .map(|path| crate::config::redact_path(&path.display().to_string())),
                 "state": self.config.config_file_state.as_str(),
                 "detail": self.config.config_file_state.detail(),
             },
@@ -1372,7 +1341,7 @@ impl SearchService {
         };
         match self.ai.search(&request).await {
             Ok(_) => Probe::ok("grok responded"),
-            Err(err) => Probe::failed(err.to_string()),
+            Err(err) => Probe::failed(crate::config::redact_urls(&err.to_string())),
         }
     }
 
@@ -2567,7 +2536,7 @@ async fn probe_source(provider: &dyn SourceProvider, sample_url: &str) -> Probe 
     let filters = SearchFilters::default();
     match provider.search_sources("ping", 1, &filters).await {
         Ok(_) => Probe::ok(format!("reachable (sample probe via {sample_url} ok)")),
-        Err(err) => Probe::failed(err.to_string()),
+        Err(err) => Probe::failed(crate::config::redact_urls(&err.to_string())),
     }
 }
 
@@ -2711,7 +2680,7 @@ mod transport_dispatch_tests {
         let report = svc.doctor().await;
         assert_eq!(report["provider"], "openai_compatible");
         assert_eq!(report["transport"], "openai_compatible");
-        assert_eq!(report["grok"]["api_url"], "https://compat.example/v1");
+        assert_eq!(report["grok"]["api_url"], "******");
         assert_eq!(report["grok"]["model"], "gpt-4o-mini");
         assert_eq!(report["grok"]["x_search_enabled"], false);
     }
@@ -2805,8 +2774,8 @@ mod transport_dispatch_tests {
 
         assert_eq!(report["config_file"]["state"], "rejected");
         assert_eq!(
-            report["config_file"]["path"], "/tmp/does-not-matter.toml",
-            "the operator needs to know which file: {report}"
+            report["config_file"]["path"], "does-not-matter.toml",
+            "the filename identifies the file without leaking its directory: {report}"
         );
         assert!(
             report["config_file"]["detail"]
@@ -2842,9 +2811,9 @@ mod transport_dispatch_tests {
             ("EXA_API_URL", "https://exa.example"),
             ("TAVILY_API_URL", "https://tavily.example"),
         ]);
-        let expected_grok = config.grok_api_url.clone();
-        let expected_exa = config.exa_api_url.clone();
-        let expected_tavily = config.tavily_api_url.clone();
+        let expected_grok = crate::config::redact_url(&config.grok_api_url);
+        let expected_exa = crate::config::redact_url(&config.exa_api_url);
+        let expected_tavily = crate::config::redact_url(&config.tavily_api_url);
 
         let report = service_for_config(config).doctor().await;
 

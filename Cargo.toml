@@ -29,6 +29,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml_edit = "0.22"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 getrandom = "0.3"
@@ -39,7 +40,7 @@ quick-xml = { version = "0.37", default-features = false, features = ["encoding"
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json"] }
 
 [features]
-# Native Streamable HTTP transport (remote, multi-tenant, bring-your-own-key).
+# Native Streamable HTTP transport (remote, server-held keys, bearer-token auth).
 # OFF by default: the default build stays a pure stdio binary — no axum, no
 # multi-threaded runtime — so local stdio users are entirely unaffected. The
 # server build opts in with `--features http`.

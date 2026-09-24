@@ -199,9 +199,8 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                 // calling client's LLM must not choose the Grok model or focus
                 // platform (issue #15) — it hallucinates names like `grok-4` that
                 // override the operator's configured model. The model is fixed by
-                // config (GROK_SEARCH_MODEL) or the per-request X-Grok-Model
-                // header; leaving these None routes through the default in
-                // build_search_request.
+                // config (GROK_SEARCH_MODEL); leaving these None routes through
+                // the default in build_search_request.
                 platform: None,
                 model: None,
                 extra_sources: args

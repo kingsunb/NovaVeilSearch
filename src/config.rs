@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
@@ -455,12 +455,12 @@ impl Config {
     pub fn redacted_diagnostics(&self) -> String {
         format!(
             "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} default_extra_sources={} fallback_sources={} timeout_seconds={} github_token={}",
-            self.grok_api_url,
+            redact_url(&self.grok_api_url),
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
             self.grok_auth_file
                 .as_ref()
-                .map(|p| p.display().to_string())
+                .map(|p| redact_path(&p.display().to_string()))
                 .unwrap_or_else(|| "default".to_string()),
             self.grok_model,
             self.web_search_enabled,
@@ -474,6 +474,275 @@ impl Config {
             self.timeout.as_secs(),
             self.github_token_status()
         )
+    }
+}
+
+/// The four search sources the web settings editor manages.
+const ALLOWED_SOURCE_NAMES: [&str; 4] = ["tavily", "exa", "tinyfish", "firecrawl"];
+
+/// Maximum accepted length for a submitted API-key value. Generous enough for
+/// any real key, small enough that a spam body can't blow up the file.
+const MAX_API_KEY_CHARS: usize = 4096;
+
+/// Two-state presence marker for a secret. Serialized as `"set"` / `"unset"` —
+/// the value itself is never emitted, not even a fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyStatus {
+    Set,
+    Unset,
+}
+
+/// Effective, masked view of one search source (`enabled` + `api_key` presence).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceView {
+    pub enabled: bool,
+    pub api_key: KeyStatus,
+}
+
+/// Effective, masked view of the whole editable search-source configuration.
+/// `config_file` is the redacted basename of the resolved path (or `None` when
+/// no path resolves); `config_file_state` is `"absent"` | `"loaded"` |
+/// `"rejected"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourcesView {
+    pub source_providers: Vec<String>,
+    pub sources: std::collections::BTreeMap<String, SourceView>,
+    pub env_overrides: std::collections::BTreeMap<String, bool>,
+    pub config_file: Option<String>,
+    pub config_file_state: String,
+}
+
+/// Editable subset accepted by `PUT /api/config`. `None` = "unchanged";
+/// `Some("")` on an `*_api_key` = "clear the key". Unknown top-level keys are
+/// rejected by serde's `deny_unknown_fields`.
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SourceEdits {
+    pub tavily_enabled: Option<bool>,
+    pub tavily_api_key: Option<String>,
+    pub firecrawl_enabled: Option<bool>,
+    pub firecrawl_api_key: Option<String>,
+    pub tinyfish_enabled: Option<bool>,
+    pub tinyfish_api_key: Option<String>,
+    pub exa_enabled: Option<bool>,
+    pub exa_api_key: Option<String>,
+    pub source_providers: Option<Vec<String>>,
+}
+
+/// One structural/semantic validation error, shaped for the HTTP 400 body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldError {
+    pub field: String,
+    pub message: String,
+}
+
+/// Effective, masked view of what the server currently uses (env > file > defaults).
+pub fn load_source_config(env: &HashMap<String, String>) -> SourcesView {
+    let cfg = Config::load_from(env.clone());
+    let mut sources = std::collections::BTreeMap::new();
+    for name in ALLOWED_SOURCE_NAMES {
+        let (enabled, api_key) = match name {
+            "tavily" => (cfg.tavily_enabled, &cfg.tavily_api_key),
+            "firecrawl" => (cfg.firecrawl_enabled, &cfg.firecrawl_api_key),
+            "tinyfish" => (cfg.tinyfish_enabled, &cfg.tinyfish_api_key),
+            _ => (cfg.exa_enabled, &cfg.exa_api_key),
+        };
+        sources.insert(
+            name.to_string(),
+            SourceView {
+                enabled,
+                api_key: if api_key.is_some() {
+                    KeyStatus::Set
+                } else {
+                    KeyStatus::Unset
+                },
+            },
+        );
+    }
+
+    SourcesView {
+        source_providers: cfg.source_providers.clone(),
+        sources,
+        env_overrides: env_override_map(env),
+        config_file: cfg
+            .config_file_path
+            .as_ref()
+            .map(|p| redact_path(&p.display().to_string())),
+        config_file_state: cfg.config_file_state.as_str().to_string(),
+    }
+}
+
+/// Returns a (possibly empty) list of structural/semantic errors for `edits`.
+/// Empty list = safe to write. Never mutates anything.
+pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    for (field, value) in [
+        ("tavily_api_key", edits.tavily_api_key.as_deref()),
+        ("firecrawl_api_key", edits.firecrawl_api_key.as_deref()),
+        ("tinyfish_api_key", edits.tinyfish_api_key.as_deref()),
+        ("exa_api_key", edits.exa_api_key.as_deref()),
+    ] {
+        if let Some(raw) = value {
+            let trimmed = raw.trim();
+            if trimmed.len() > MAX_API_KEY_CHARS {
+                errors.push(FieldError {
+                    field: field.to_string(),
+                    message: format!("api key too long (max {MAX_API_KEY_CHARS} chars)"),
+                });
+            } else if trimmed.chars().any(char::is_control) {
+                errors.push(FieldError {
+                    field: field.to_string(),
+                    message: "api key contains control characters".to_string(),
+                });
+            }
+        }
+    }
+
+    if let Some(list) = &edits.source_providers {
+        for name in list {
+            let normalized = normalize_source_provider(name);
+            if !ALLOWED_SOURCE_NAMES.contains(&normalized.as_str()) {
+                errors.push(FieldError {
+                    field: "source_providers".to_string(),
+                    message: format!(
+                        "unknown source provider \"{name}\" (valid: tavily, exa, tinyfish, firecrawl)"
+                    ),
+                });
+                break;
+            }
+        }
+    }
+
+    errors
+}
+
+/// Merge `edits` into the resolved config.toml (atomic temp+rename) and return
+/// the re-read effective view. Errors are I/O-ish and map to HTTP 500.
+pub fn write_source_config(
+    env: &HashMap<String, String>,
+    edits: &SourceEdits,
+) -> anyhow::Result<SourcesView> {
+    let path = resolve_config_path(env).ok_or_else(|| {
+        anyhow::anyhow!("cannot resolve config path (set GROK_SEARCH_CONFIG or HOME)")
+    })?;
+
+    let mut doc = if path.exists() {
+        let body = std::fs::read_to_string(&path)?;
+        body.parse::<toml_edit::DocumentMut>().map_err(|err| {
+            anyhow::anyhow!(
+                "refusing to overwrite unparseable {}: {err}",
+                path.display()
+            )
+        })?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    apply_edits(&mut doc, edits);
+    atomic_write(&path, &doc.to_string())?;
+
+    Ok(load_source_config(env))
+}
+
+/// TOML field -> whether its env var is present in the operator environment.
+/// Presence (not value) is what decides precedence: once the env var exists the
+/// file value cannot win, so the UI must mark that field read-only.
+fn env_override_map(env: &HashMap<String, String>) -> std::collections::BTreeMap<String, bool> {
+    [
+        ("tavily_enabled", "TAVILY_ENABLED"),
+        ("tavily_api_key", "TAVILY_API_KEY"),
+        ("firecrawl_enabled", "FIRECRAWL_ENABLED"),
+        ("firecrawl_api_key", "FIRECRAWL_API_KEY"),
+        ("tinyfish_enabled", "TINYFISH_ENABLED"),
+        ("tinyfish_api_key", "TINYFISH_API_KEY"),
+        ("exa_enabled", "EXA_ENABLED"),
+        ("exa_api_key", "EXA_API_KEY"),
+        ("source_providers", "GROK_SEARCH_SOURCE_PROVIDERS"),
+    ]
+    .into_iter()
+    .map(|(field, env_var)| (field.to_string(), env.contains_key(env_var)))
+    .collect()
+}
+
+/// Apply only the present (`Some`) edit fields onto a `DocumentMut`. Comments,
+/// key order, and every unmanaged key are preserved verbatim.
+fn apply_edits(doc: &mut toml_edit::DocumentMut, edits: &SourceEdits) {
+    for (base, enabled, api_key) in [
+        (
+            "tavily",
+            edits.tavily_enabled,
+            edits.tavily_api_key.as_deref(),
+        ),
+        (
+            "firecrawl",
+            edits.firecrawl_enabled,
+            edits.firecrawl_api_key.as_deref(),
+        ),
+        (
+            "tinyfish",
+            edits.tinyfish_enabled,
+            edits.tinyfish_api_key.as_deref(),
+        ),
+        ("exa", edits.exa_enabled, edits.exa_api_key.as_deref()),
+    ] {
+        if let Some(value) = enabled {
+            let key = format!("{base}_enabled");
+            doc[key.as_str()] = toml_edit::value(value);
+        }
+        if let Some(value) = api_key {
+            let key = format!("{base}_api_key");
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                doc.remove(key.as_str());
+            } else {
+                doc[key.as_str()] = toml_edit::value(trimmed);
+            }
+        }
+    }
+
+    if let Some(list) = &edits.source_providers {
+        let mut normalized: Vec<String> = Vec::new();
+        for name in list {
+            let name = normalize_source_provider(name);
+            if !normalized.contains(&name) {
+                normalized.push(name);
+            }
+        }
+        let arr = toml_edit::Array::from_iter(
+            normalized
+                .iter()
+                .map(|name| toml_edit::Value::from(name.as_str())),
+        );
+        doc["source_providers"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+    }
+}
+
+/// Normalize one `source_providers` entry: trim + lowercase.
+fn normalize_source_provider(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// Temp file in the same directory + `rename` over the target; creates parent
+/// dirs. The temp file lives on the same filesystem so the rename is atomic.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&tmp, contents)?;
+    let file = std::fs::File::open(&tmp)?;
+    let _ = file.sync_all(); // best-effort fsync before rename
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
     }
 }
 
@@ -813,6 +1082,118 @@ fn redact(value: Option<&str>) -> String {
     }
 }
 
+/// Opaque, fixed mask reported for any configured endpoint URL. `doctor` never
+/// reveals an upstream gateway's scheme, hostname, port, or path: a configured
+/// `http://grok2api:8000/v1` is reported as `******`. Empty input (endpoint not
+/// configured) stays empty so `doctor` still distinguishes set from unset.
+pub(crate) fn redact_url(url: &str) -> String {
+    if url.is_empty() {
+        String::new()
+    } else {
+        "******".to_string()
+    }
+}
+
+/// Replaces every URL embedded in `text` with a fixed opaque mask, so error
+/// strings that quote an upstream endpoint — e.g. reqwest's
+/// `… for url (http://grok2api:8000/v1/responses)` — cannot reveal the host,
+/// port, or path through `doctor` probe details. Non-URL text is preserved.
+pub(crate) fn redact_urls(text: &str) -> String {
+    if !text.contains("://") {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find("://") {
+        let colon = cursor + rel;
+        // Backtrack to the leading byte of the scheme.
+        let mut start = colon;
+        while start > cursor && is_scheme_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        out.push_str(&text[cursor..start]);
+
+        // Consume the full URL (authority, path, query, fragment) until a
+        // delimiter that cannot appear in a URL. Stop at any non-ASCII byte
+        // too so `cursor` always lands on a UTF-8 boundary.
+        let mut end = colon + 3;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            let is_delimiter = matches!(
+                byte,
+                b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b')' | b'>' | b',' | b';' | b'<'
+            );
+            if is_delimiter || byte >= 0x80 {
+                break;
+            }
+            end += 1;
+        }
+
+        out.push_str("******");
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+/// Redacts an absolute filesystem path to its final component so diagnostics
+/// never leak the user's home directory or directory layout. Both Unix forward
+/// slashes and Windows backslashes are treated as separators:
+/// `/home/grokmcp/.config/nova-veil-search/auth.json` -> `auth.json`.
+pub(crate) fn redact_path(path: &str) -> String {
+    path.rsplit(|c: char| c == '/' || c == '\\')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::{redact_path, redact_url, redact_urls};
+
+    #[test]
+    fn configured_url_is_fully_masked_and_empty_stays_empty() {
+        assert_eq!(redact_url("http://grok2api:8000/v1"), "******");
+        assert_eq!(redact_url("https://api.x.ai/v1"), "******");
+        // Schemeless input is masked too — never echoed back raw.
+        assert_eq!(redact_url("grok2api:8000/v1"), "******");
+        assert_eq!(redact_url(""), "");
+    }
+
+    #[test]
+    fn embedded_urls_in_error_text_are_fully_masked() {
+        let err = "Grok Responses request failed: error sending request for url (http://grok2api:8000/v1/responses)";
+        let masked = redact_urls(err);
+        assert!(masked.contains("url (******)"), "{masked}");
+        assert!(!masked.contains("grok2api"), "{masked}");
+        assert!(!masked.contains(":8000"), "{masked}");
+    }
+
+    #[test]
+    fn text_without_url_is_unchanged() {
+        assert_eq!(redact_urls("grok responded"), "grok responded");
+    }
+
+    #[test]
+    fn path_redacts_to_final_component() {
+        assert_eq!(
+            redact_path("/home/grokmcp/.config/nova-veil-search/auth.json"),
+            "auth.json"
+        );
+        assert_eq!(
+            redact_path(r"C:\Users\chen\.config\nova-veil-search\auth.json"),
+            "auth.json"
+        );
+        assert_eq!(redact_path("default"), "default");
+        assert_eq!(redact_path("auth.json"), "auth.json");
+    }
+}
+
 #[cfg(test)]
 mod source_config_tests {
     use super::*;
@@ -976,5 +1357,238 @@ mod transport_field_tests {
             ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
         ]);
         assert_eq!(cfg.transport, Transport::Responses);
+    }
+}
+
+#[cfg(test)]
+mod source_config_api_tests {
+    use super::*;
+
+    fn env_with_config(path: &Path) -> HashMap<String, String> {
+        HashMap::from([("GROK_SEARCH_CONFIG".to_string(), path.display().to_string())])
+    }
+
+    #[test]
+    fn secret_masking_reports_set_and_never_the_value() {
+        let env = HashMap::from([("TAVILY_API_KEY".to_string(), "tvly-secret".to_string())]);
+        let view = load_source_config(&env);
+        assert_eq!(view.sources["tavily"].api_key, KeyStatus::Set);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("tvly-secret"), "secret value leaked: {json}");
+        assert!(json.contains("\"api_key\":\"set\""), "{json}");
+    }
+
+    #[test]
+    fn env_override_detection_is_presence_based() {
+        let mut env = HashMap::new();
+        env.insert("TAVILY_API_KEY".to_string(), "tvly-secret".to_string());
+        env.insert("TAVILY_ENABLED".to_string(), "false".to_string());
+        env.insert(
+            "GROK_SEARCH_SOURCE_PROVIDERS".to_string(),
+            "tavily,exa".to_string(),
+        );
+        let view = load_source_config(&env);
+        assert_eq!(view.env_overrides["tavily_api_key"], true);
+        assert_eq!(view.env_overrides["tavily_enabled"], true);
+        assert_eq!(view.env_overrides["source_providers"], true);
+        assert_eq!(view.env_overrides["exa_api_key"], false);
+        assert_eq!(view.env_overrides["exa_enabled"], false);
+        assert_eq!(view.sources["tavily"].api_key, KeyStatus::Set);
+        assert!(!view.sources["tavily"].enabled);
+        assert_eq!(view.sources["exa"].api_key, KeyStatus::Unset);
+        assert_eq!(view.source_providers, vec!["tavily", "exa"]);
+    }
+
+    #[test]
+    fn read_write_round_trip_applies_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "tavily_enabled = false\n").unwrap();
+        let env = env_with_config(&path);
+
+        let view = write_source_config(
+            &env,
+            &SourceEdits {
+                tavily_enabled: Some(true),
+                exa_api_key: Some("exa-k".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(view.sources["tavily"].enabled);
+        assert_eq!(view.sources["exa"].api_key, KeyStatus::Set);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("tavily_enabled = true"), "{body}");
+        assert!(body.contains("exa_api_key = \"exa-k\""), "{body}");
+    }
+
+    #[test]
+    fn write_preserves_comments_and_untouched_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\ncache_size = 12\ntavily_enabled = false\n",
+        )
+        .unwrap();
+        let env = env_with_config(&path);
+
+        write_source_config(
+            &env,
+            &SourceEdits {
+                tavily_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("# keep me"), "{body}");
+        assert!(body.contains("cache_size = 12"), "{body}");
+        assert!(body.contains("tavily_enabled = true"), "{body}");
+        assert!(!body.contains("tavily_enabled = false"), "{body}");
+    }
+
+    #[test]
+    fn clear_key_removes_it_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "exa_api_key = \"exa-k\"\nexa_enabled = true\n").unwrap();
+        let env = env_with_config(&path);
+
+        let view = write_source_config(
+            &env,
+            &SourceEdits {
+                exa_api_key: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(view.sources["exa"].api_key, KeyStatus::Unset);
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("exa_api_key"), "{body}");
+    }
+
+    #[test]
+    fn missing_file_is_created_with_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("dir").join("config.toml");
+        let env = env_with_config(&path);
+
+        let view = write_source_config(
+            &env,
+            &SourceEdits {
+                tavily_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!view.sources["tavily"].enabled);
+        assert!(path.exists(), "file must be created");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("tavily_enabled = false"), "{body}");
+    }
+
+    #[test]
+    fn corrupt_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is {not toml").unwrap();
+        let env = env_with_config(&path);
+
+        let err = write_source_config(
+            &env,
+            &SourceEdits {
+                tavily_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "this is {not toml");
+    }
+
+    #[test]
+    fn validation_rejects_bad_input() {
+        let long_key = "x".repeat(4097);
+        assert!(!validate_edits(&SourceEdits {
+            tavily_api_key: Some(long_key),
+            ..Default::default()
+        })
+        .is_empty());
+        assert!(!validate_edits(&SourceEdits {
+            exa_api_key: Some("a\nb".to_string()),
+            ..Default::default()
+        })
+        .is_empty());
+        assert!(!validate_edits(&SourceEdits {
+            firecrawl_api_key: Some("a\0b".to_string()),
+            ..Default::default()
+        })
+        .is_empty());
+        assert!(!validate_edits(&SourceEdits {
+            source_providers: Some(vec!["bing".to_string()]),
+            ..Default::default()
+        })
+        .is_empty());
+        assert!(validate_edits(&SourceEdits {
+            tavily_enabled: Some(true),
+            exa_api_key: Some("exa-k".to_string()),
+            ..Default::default()
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn source_providers_are_normalized_and_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let env = env_with_config(&path);
+
+        write_source_config(
+            &env,
+            &SourceEdits {
+                source_providers: Some(vec![
+                    " Exa ".to_string(),
+                    "tavily".to_string(),
+                    "EXA".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("source_providers = [\"exa\", \"tavily\"]"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn serde_shape_rejects_unknown_and_wrong_types() {
+        assert!(serde_json::from_str::<SourceEdits>(r#"{"nonsense": true}"#).is_err());
+        assert!(serde_json::from_str::<SourceEdits>(r#"{"tavily_enabled": "yes"}"#).is_err());
+
+        let edits: SourceEdits = serde_json::from_str(
+            r#"{"tavily_enabled": true, "exa_api_key": null, "source_providers": ["tavily"]}"#,
+        )
+        .unwrap();
+        assert_eq!(edits.tavily_enabled, Some(true));
+        assert_eq!(edits.exa_api_key, None);
+        assert_eq!(edits.source_providers, Some(vec!["tavily".to_string()]));
+
+        // A 4096-char key is accepted; validation catches only control chars and
+        // over-length, both exercised above.
+        assert!(validate_edits(&SourceEdits {
+            tinyfish_api_key: Some("k".repeat(4096)),
+            ..Default::default()
+        })
+        .is_empty());
     }
 }

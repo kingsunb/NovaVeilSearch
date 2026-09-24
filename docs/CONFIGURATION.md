@@ -8,51 +8,35 @@ NovaVeilSearch reads configuration from two sources, merged with the following p
 
 The config file is optional; missing files are skipped silently. See the [Config file](#config-file) section below for the TOML schema. The AI provider contract is intentionally narrow: configure a Grok/OpenAI-compatible root URL and the server calls `/v1/responses`.
 
-> **Configuring the remote HTTP transport?** There are two modes, picked by whether the server sets `GROK_MCP_API_TOKEN`. In **bring-your-own-key** mode (default) the server stores no credentials and each request supplies its keys as **HTTP headers**. In **server-config** mode the server holds the provider keys and every request authenticates with `Authorization: Bearer <token>`. The header-vs-token split is under [Configuration channels](#configuration-channels-stdio-env-vs-remote-headers) directly below.
+> **Configuring the remote HTTP transport?** There is one credential model — **server-held keys** — and authentication is mandatory. Set `GROK_MCP_API_TOKEN` (required) and put the provider keys in the server's own environment; every request authenticates with `Authorization: Bearer <token>` (the master token, or a short-lived session token from `POST /login`). Callers never supply their own keys. See [Configuration channels](#configuration-channels-stdio-env-vs-remote-env) directly below.
 
-## Configuration channels (stdio env vs remote headers)
+## Configuration channels (stdio env vs remote env)
 
-Which channel carries your config is decided by the MCP **transport**, not a project setting — the two transports have no other way to receive per-instance config:
+Which channel carries your config is decided by the MCP **transport**, not a project setting:
 
-- **stdio (local):** the MCP client spawns `nova-veil-search` as a child process and can only hand it **environment variables** (the `env` block in your client config). There is no HTTP, so there are no headers.
-- **Streamable HTTP (remote):** the client talks to an already-running server that can run in one of two modes:
-  - **bring-your-own-key (default — `GROK_MCP_API_TOKEN` unset):** the server stores **no** credentials; each request carries its own keys as **HTTP headers** (server-side keys are deliberately stripped).
-  - **server-config (`GROK_MCP_API_TOKEN` set):** the server holds the provider keys in its own environment; every request authenticates with a single `Authorization: Bearer <token>` header and then runs on the server's keys. Caller `X-*-Api-Key` headers still override per request if present.
+- **stdio (local):** the MCP client spawns `nova-veil-search` as a child process and hands it **environment variables** (the `env` block in your client config).
+- **Streamable HTTP (remote):** the client talks to an already-running server whose **own environment** holds every key and all operator settings. Key names are identical to the stdio env keys — nothing is configurable per caller request:
 
-Both carry the **same configuration values** — only the delivery differs. Everything else in this document uses the **env-key** name; on the remote transport in BYOK mode, send the matching header from this table:
+| Setting | env key |
+|---|---|
+| Grok API key | `GROK_SEARCH_API_KEY` |
+| Grok gateway URL | `GROK_SEARCH_URL` |
+| Grok model | `GROK_SEARCH_MODEL` |
+| Tavily API key | `TAVILY_API_KEY` |
+| Firecrawl API key | `FIRECRAWL_API_KEY` |
+| TinyFish API key | `TINYFISH_API_KEY` |
+| Exa API key | `EXA_API_KEY` |
+| GitHub token | `GITHUB_TOKEN` |
 
-| Setting | stdio env key | remote HTTP header |
-|---|---|---|
-| Grok API key | `GROK_SEARCH_API_KEY` | `X-Grok-Api-Key` |
-| Grok gateway URL | `GROK_SEARCH_URL` | `X-Grok-Base-Url` |
-| Grok model | `GROK_SEARCH_MODEL` | `X-Grok-Model` |
-| Tavily API key | `TAVILY_API_KEY` | `X-Tavily-Api-Key` |
-| Firecrawl API key | `FIRECRAWL_API_KEY` | `X-Firecrawl-Api-Key` |
-| TinyFish API key | `TINYFISH_API_KEY` | `X-Tinyfish-Api-Key` |
-| Exa API key | `EXA_API_KEY` | `X-Exa-Api-Key` |
-| GitHub token | `GITHUB_TOKEN` | `X-GitHub-Token` |
+All entries are **operator-fixed** on the remote transport — set once in the server's own environment, never per request. **Two groups are stdio-only:** OAuth (`GROK_SEARCH_AUTH_MODE` / `GROK_SEARCH_AUTH_FILE`) and the OpenAI-compatible chat-completions transport (`OPENAI_COMPATIBLE_API_URL` / `_API_KEY` / `_MODEL`). The remote server serves Grok **Responses** only; to run a chat-completions relay, use the stdio transport.
 
-Only these eight are accepted as headers — the caller's per-request secrets plus the gateway/model that pair with the caller's key. Most other settings here (timeouts, budgets, enrichment knobs, Tavily/Firecrawl base URLs, feature toggles) are **operator-fixed**: set once in the server's own environment, never per request. `GROK_SEARCH_URL` / `GROK_SEARCH_MODEL` have operator defaults too; the `X-Grok-Base-Url` / `X-Grok-Model` headers override them per request. **Two groups are stdio-only — stripped over HTTP, not operator-fixed:** OAuth (`GROK_SEARCH_AUTH_MODE` / `GROK_SEARCH_AUTH_FILE`) and the OpenAI-compatible chat-completions transport (`OPENAI_COMPATIBLE_API_URL` / `_API_KEY` / `_MODEL`). The remote server serves Grok **Responses** only; to run a chat-completions relay, use the stdio transport.
+### Minimal setup — remote
 
-The header is `X-` + the env key in `Kebab-Case`, but a few names are historical (the `GROK_SEARCH_` prefix collapses to `X-Grok-`, and `GROK_SEARCH_URL` → `X-Grok-Base-Url`) — **read names off the table above rather than deriving them by hand.**
-
-### Minimal setup — each transport
-
-Remote, server-config mode (operator holds the keys; client sends one token):
+The operator holds the keys; the client sends one token:
 
 ```bash
 claude mcp add --transport http nova-veil-search https://<host>/nova-veil-search/mcp \
   --header "Authorization: Bearer <token>"
-```
-
-Remote, bring-your-own-key mode — headers:
-
-```bash
-claude mcp add --transport http nova-veil-search https://<host>/nova-veil-search/mcp \
-  --header "X-Grok-Api-Key: <key>" \
-  --header "X-Grok-Base-Url: https://<gateway>/v1" \
-  --header "X-Grok-Model: <model>" \
-  --header "X-Tavily-Api-Key: tvly-..."
 ```
 
 Local (stdio) — the same values as `env`:
@@ -72,6 +56,17 @@ Local (stdio) — the same values as `env`:
   }
 }
 ```
+
+### Settings/config frontend (opt-in, `NOVA_CONFIG_UI`)
+
+The embedded settings SPA (`GET /`) and the config read/write API (`GET/PUT
+`/api/config`) are **off by default**: the server stays a pure backend
+(`/mcp`, `/messages`, `/login`) with no frontend routes and no per-request
+`config.toml` read. Set `NOVA_CONFIG_UI=true` (also `1`/`yes`, case-insensitive)
+to enable both. ON serves `GET /` and lets each request honor `config.toml`
+edits with the usual precedence (env > file > defaults); OFF returns `404` on
+`/` and `/api/config` and keeps request config env-only (zero per-request
+disk I/O).
 
 ## Grok Responses
 

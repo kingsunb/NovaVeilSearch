@@ -1,28 +1,35 @@
 //! Native Streamable HTTP transport (Cargo feature `http`).
 //!
 //! Exposes the same MCP tools as the stdio transport over a single
-//! `POST /mcp` endpoint. Two credential modes exist, chosen by whether the
-//! operator sets `GROK_MCP_API_TOKEN`:
+//! `POST /mcp` endpoint. There is exactly one credential model — **server
+//! keys only** — and authentication is mandatory:
 //!
-//! - **bring-your-own-key (default, token unset):** the server process holds
-//!   **no** credentials. Each request carries the caller's own API keys in
-//!   headers (`X-Grok-Api-Key` / `X-Tavily-Api-Key` / `X-Firecrawl-Api-Key` /
-//!   `X-Tinyfish-Api-Key` / `X-Exa-Api-Key` / `X-GitHub-Token`); any
-//!   server-side keys are stripped.
-//! - **server-config (`GROK_MCP_API_TOKEN` set):** the operator configures the
-//!   provider keys in the server's own environment, and every request must
-//!   authenticate with `Authorization: Bearer <token>` (exact, constant-time
-//!   match — fail-closed 401 otherwise). Authenticated requests run on the
-//!   server's keys; a caller-supplied `X-*-Api-Key` header still overrides per
-//!   request for flexibility.
+//! - Provider keys always come from the server's own environment or its
+//!   `config.toml` (`GROK_*`, `TAVILY_API_KEY`, `EXA_API_KEY`,
+//!   `TINYFISH_API_KEY`, `FIRECRAWL_API_KEY`, …; environment wins). Callers can
+//!   no longer supply their own keys via `X-*-Api-Key` request headers; those
+//!   headers are ignored.
+//! - Every request must authenticate with `Authorization: Bearer <token>` —
+//!   either the master token `GROK_MCP_API_TOKEN` (constant-time match,
+//!   fail-closed 401 otherwise) or a short-lived session token issued by
+//!   `POST /login`.
+//! - `POST /login` (enabled by setting `NOVA_ADMIN_PASSWORD`) verifies the
+//!   admin username/password and returns a session token with a sliding TTL
+//!   (`NOVA_SESSION_TTL_SECONDS`, default 12 h) held in an in-memory store.
 //!
-//! In both modes a fully-credentialed [`SearchService`] is built per request
-//! via [`SearchService::for_request`], reusing one shared HTTP client and one
+//! A fully-credentialed [`SearchService`] is built per request via
+//! [`SearchService::for_request`], reusing one shared HTTP client and one
 //! process-wide source cache (so `get_sources` continuation still works across
 //! requests). The whole module is gated behind the `http` feature so the
 //! default stdio build never links axum.
 //!
 //! TLS terminates upstream (Caddy); this server binds loopback only.
+//!
+//! A separate `POST /messages` endpoint additionally serves an
+//! Anthropic-compatible Messages API (native `web_search_20250305` server tool)
+//! so the official DeepSeek web-search backend can point its `baseURL` at nova
+//! — the zero-plugin way to plug nova in as DSH’s search provider with nothing
+//! but a URL and a key.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -33,7 +40,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use serde_json::Value;
@@ -44,6 +51,7 @@ use crate::cache::SourceCache;
 use crate::config::Config;
 use crate::error::NovaVeilSearchError;
 use crate::mcp::{error_response, handle_message};
+use crate::model::tool::{WebSearchInput, WebSearchOutput};
 use crate::service::SearchService;
 
 /// Max JSON request body. MCP tool calls are tiny; anything larger is abuse.
@@ -57,6 +65,36 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 /// getaddrinfo calls can run at once.
 const MAX_DNS_LOOKUPS: usize = 8;
 
+/// Protocol revisions the Streamable HTTP transport implements. Excludes
+/// 2024-11-05 (the deprecated HTTP+SSE transport this endpoint does not serve)
+/// and 2025-03-26 (which still mandates JSON-RPC batching — removed only in
+/// 2025-06-18; since this endpoint rejects batches, it declares 2025-06-18+ only).
+const HTTP_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
+
+/// Operator env var holding the master bearer token. Every request to `/mcp`
+/// must authenticate with `Authorization: Bearer <this token or a login-issued
+/// session token>`. Provider keys always come from the server's own
+/// environment — callers never supply their own keys.
+const API_TOKEN_ENV: &str = "GROK_MCP_API_TOKEN";
+
+/// Admin username / password for the `POST /login` endpoint that issues
+/// short-lived session tokens for the web UI. An unset/empty
+/// `NOVA_ADMIN_PASSWORD` disables `/login` (master-token auth still applies).
+const ADMIN_USER_ENV: &str = "NOVA_ADMIN_USER";
+const ADMIN_PASSWORD_ENV: &str = "NOVA_ADMIN_PASSWORD";
+const DEFAULT_ADMIN_USER: &str = "admin";
+
+/// Session-token TTL override (seconds). Defaults to 12 hours.
+const SESSION_TTL_ENV: &str = "NOVA_SESSION_TTL_SECONDS";
+const DEFAULT_SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
+
+/// Opt-in flag for the settings/config frontend (`GET /` + `/api/config`) and
+/// the per-request `config.toml` read. OFF by default: pure backend.
+const CONFIG_UI_ENV: &str = "NOVA_CONFIG_UI";
+
+/// Max login-form body. Two short fields; anything larger is abuse.
+const MAX_LOGIN_BODY_BYTES: usize = 4 * 1024;
+
 /// Cadence (seconds) of the SSE heartbeat frames emitted while a long-running
 /// tool call is still working. The first frame goes out immediately, keeping
 /// the stream from ever being idle long enough for a fronting proxy to give
@@ -69,112 +107,134 @@ const SSE_KEEPALIVE_SECONDS: u64 = 15;
 /// event.
 const SSE_HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
-/// Protocol revisions the Streamable HTTP transport implements. Excludes
-/// 2024-11-05 (the deprecated HTTP+SSE transport this endpoint does not serve)
-/// and 2025-03-26 (which still mandates JSON-RPC batching — removed only in
-/// 2025-06-18; since this endpoint rejects batches, it declares 2025-06-18+ only).
-const HTTP_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
-
-/// Operator-set env keys that must NEVER survive into a per-request config:
-/// credentials come only from request headers, never from the server process
-/// environment. Stripped from the operator base env once at startup so a stray
-/// server-side key can never leak into a tenant's request.
-const SECRET_ENV_KEYS: &[&str] = &[
-    "GROK_SEARCH_API_KEY",
-    "TAVILY_API_KEY",
-    "FIRECRAWL_API_KEY",
-    "TINYFISH_API_KEY",
-    "EXA_API_KEY",
-    "GITHUB_TOKEN",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "OPENAI_COMPATIBLE_API_URL",
-    "OPENAI_COMPATIBLE_MODEL",
-    "GROK_SEARCH_AUTH_MODE",
-    "GROK_SEARCH_AUTH_FILE",
-];
-
-/// Operator env var that switches the HTTP transport into server-config mode:
-/// a non-empty token means every request must authenticate with
-/// `Authorization: Bearer <token>` and provider keys are read from the
-/// server's own environment (not stripped). Unset/empty -> bring-your-own-key
-/// mode. The token itself is server-only and never becomes a config key.
-const API_TOKEN_ENV: &str = "GROK_MCP_API_TOKEN";
-
-/// Request header -> config env key overlay. Header names match on a
-/// case-insensitive basis (axum lowercases header names).
-const HEADER_TO_ENV: &[(&str, &str)] = &[
-    ("x-grok-api-key", "GROK_SEARCH_API_KEY"),
-    ("x-tavily-api-key", "TAVILY_API_KEY"),
-    ("x-firecrawl-api-key", "FIRECRAWL_API_KEY"),
-    ("x-tinyfish-api-key", "TINYFISH_API_KEY"),
-    ("x-exa-api-key", "EXA_API_KEY"),
-    ("x-github-token", "GITHUB_TOKEN"),
-    // Non-secret: lets a caller pick the Grok model per request (pairs with
-    // X-Grok-Base-Url, since model names are gateway-specific). Absent header
-    // -> the operator default model.
-    ("x-grok-model", "GROK_SEARCH_MODEL"),
-];
-
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     /// Shared across every request: one connection pool, operator timeout.
     http_client: reqwest::Client,
     /// One process-wide cache so `get_sources` continuation survives requests.
     cache: Arc<Mutex<SourceCache>>,
-    /// Operator defaults that seed every request's config. BYOK mode: secrets
-    /// stripped (headers only). Server-config mode: server's provider keys kept.
-    base_env: Arc<HashMap<String, String>>,
+    /// Operator defaults that seed every request's config: the server's own
+    /// provider keys (callers supply no keys).
+    pub(crate) base_env: Arc<HashMap<String, String>>,
     /// Allowed `Origin` values; `None` means no allowlist configured (allow).
-    allowed_origins: Arc<Option<HashSet<String>>>,
+    pub(crate) allowed_origins: Arc<Option<HashSet<String>>>,
     /// Bounds concurrent in-flight requests (DoS protection on a small box).
     limiter: Arc<Semaphore>,
-    /// Caps concurrent host resolutions (gateway + fetch-tool validation) so
-    /// hung blocking getaddrinfo calls (which outlive their timeout) can't
-    /// pile up threads.
+    /// Caps concurrent fetch-tool host resolutions so hung blocking getaddrinfo
+    /// calls (which outlive their timeout) can't pile up threads.
     dns_limiter: Arc<Semaphore>,
-    /// Operator request timeout, reused to build a per-request DNS-pinned client
-    /// for a caller-supplied gateway (`X-Grok-Base-Url`).
-    timeout: std::time::Duration,
-    /// Shared bearer token for server-config mode (`GROK_MCP_API_TOKEN`), or
-    /// `None` for bring-your-own-key mode. When set, every request must send a
-    /// matching `Authorization: Bearer` header.
-    api_token: Option<String>,
+    /// Master bearer token (`GROK_MCP_API_TOKEN`). Every request must send this
+    /// or a login-issued session token.
+    api_token: String,
+    /// In-memory session tokens issued by `POST /login`.
+    sessions: Arc<Mutex<SessionStore>>,
+    /// Admin username for `/login` (not secret; compared constant-time anyway).
+    admin_user: String,
+    /// Admin password for `/login`. `None` disables the endpoint.
+    admin_password: Option<String>,
+    /// Lifetime of a `/login`-issued session token.
+    session_ttl: std::time::Duration,
+    /// Whether the settings/config frontend (`GET /`, `/api/config`) and the
+    /// per-request `config.toml` read are enabled (`NOVA_CONFIG_UI`). Off by
+    /// default: no frontend routes, no per-request disk I/O.
+    config_ui: bool,
+}
+
+/// In-memory store of login-issued session tokens with sliding expiry.
+struct SessionStore {
+    tokens: HashMap<String, std::time::Instant>,
+}
+
+impl SessionStore {
+    fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Issue a fresh session token valid for `ttl` from now, pruning expired
+    /// tokens opportunistically.
+    fn issue(&mut self, ttl: std::time::Duration) -> String {
+        self.retain_active();
+        let token = uuid::Uuid::new_v4().to_string();
+        self.tokens
+            .insert(token.clone(), std::time::Instant::now() + ttl);
+        token
+    }
+
+    /// `true` -> the token is known and unexpired (its expiry slides by `ttl`).
+    /// `false` -> unknown or expired (expired entries are removed).
+    fn validate(&mut self, token: &str, ttl: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        match self.tokens.get(token) {
+            Some(expires) if *expires > now => {}
+            Some(_) => {
+                self.tokens.remove(token);
+                return false;
+            }
+            None => return false,
+        }
+        self.tokens.insert(token.to_string(), now + ttl);
+        true
+    }
+
+    fn retain_active(&mut self) {
+        let now = std::time::Instant::now();
+        self.tokens.retain(|_, expires| *expires > now);
+    }
 }
 
 /// Run the HTTP transport, binding `bind` (loopback in production, behind
-/// Caddy). `base_env` is the operator process environment; its non-secret
-/// entries seed every request's config. Secrets are stripped in BYOK mode and
-/// kept (as the shared credential pool) in server-config mode.
+/// Caddy). `base_env` is the operator process environment; its entries seed
+/// every request's config. Keys are always built-in (server-side) — callers
+/// supply none — and every request must authenticate with a bearer token.
 pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> anyhow::Result<()> {
     // Operator config (timeout, cache sizing, chain order) drives the shared
-    // client + cache. Secrets are handled per mode below, not here.
+    // client + cache.
     let operator_cfg = Config::from_env_map(base_env.clone());
     // Fail before binding on a bad GROK_SEARCH_SOURCE_PROVIDERS: the chain is
-    // operator-fixed (never a request header), and deferring the error to
-    // per-request service construction would leave a listener up that rejects
-    // every call.
+    // operator-fixed, and deferring the error to per-request service
+    // construction would leave a listener up that rejects every call.
     crate::service::validate_source_providers(&operator_cfg)?;
     // Restricted client: rejects redirects to non-public IP-literal targets.
     let http_client = crate::providers::http::build_restricted_client(operator_cfg.timeout);
     let cache = Arc::new(Mutex::new(SourceCache::new(operator_cfg.cache_size)));
     let allowed_origins = parse_allowed_origins(&base_env);
 
-    // Server-config mode vs bring-your-own-key: a non-empty operator token turns
-    // on shared server keys + bearer-token auth; without it the server strips
-    // every credential and each caller supplies its own (backward compatible).
+    // Auth is mandatory: the bring-your-own-key mode is gone, so the master
+    // token must be set (fail closed rather than serving an open endpoint).
     let api_token = base_env
         .get(API_TOKEN_ENV)
         .map(|value| value.trim())
         .filter(|token| !token.is_empty())
-        .map(str::to_owned);
-    let request_base = request_base_env(&base_env, api_token.as_deref());
-    if api_token.is_some() {
-        eprintln!(
-            "nova-veil-search: server-config mode — requests must send `Authorization: Bearer <token>`; provider keys come from this server's environment"
-        );
-    } else {
-        warn_ignored_secret_env(&base_env);
-    }
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{API_TOKEN_ENV} is required: this transport only serves built-in \
+                 server keys and must be protected by a bearer token"
+            )
+        })?;
+
+    // Optional admin login issuing short-lived session tokens for the web UI.
+    let admin_user = base_env
+        .get(ADMIN_USER_ENV)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+    let admin_password = base_env
+        .get(ADMIN_PASSWORD_ENV)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let session_ttl = base_env
+        .get(SESSION_TTL_ENV)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_SESSION_TTL_SECONDS));
+
+    let request_base = request_base_env(&base_env);
+    let login_enabled = admin_password.is_some();
+    let config_ui_enabled = env_is_true(&base_env, CONFIG_UI_ENV);
 
     let state = AppState {
         http_client,
@@ -183,20 +243,55 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
         allowed_origins: Arc::new(allowed_origins),
         limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
         dns_limiter: Arc::new(Semaphore::new(MAX_DNS_LOOKUPS)),
-        timeout: operator_cfg.timeout,
         api_token,
+        sessions: Arc::new(Mutex::new(SessionStore::new())),
+        admin_user,
+        admin_password,
+        session_ttl,
+        config_ui: config_ui_enabled,
     };
 
-    // Only POST is registered; axum answers other methods on /mcp with 405.
-    // Body size is capped inside the handler (after the concurrency permit is
-    // held), so no DefaultBodyLimit layer is needed.
-    let app = Router::new()
+    // Body sizes are capped inside the handlers (after the concurrency permit is
+    // held for /mcp), so no DefaultBodyLimit layer is needed.
+    let mut app = Router::new()
         .route("/mcp", post(mcp_post))
-        .with_state(state);
+        .route("/messages", post(messages_post))
+        .route("/login", post(login));
+    // The settings/config frontend is opt-in (`NOVA_CONFIG_UI`): off by default
+    // it registers no frontend routes and triggers no per-request config.toml
+    // read — the process is a pure backend (MCP + login auth) with no overhead.
+    if config_ui_enabled {
+        app = app.route("/", get(crate::web::serve_index)).route(
+            "/api/config",
+            get(crate::web::get_config).put(crate::web::put_config),
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("nova-veil-search: Streamable HTTP transport listening on http://{bind}/mcp");
-    axum::serve(listener, app).await?;
+    eprintln!(
+        "nova-veil-search: Anthropic-compatible Messages endpoint for the DeepSeek web-search backend on http://{bind}/messages"
+    );
+    eprintln!(
+        "nova-veil-search: server-config mode — requests must send `Authorization: Bearer <token>`; provider keys come from this server's environment"
+    );
+    eprintln!(
+        "nova-veil-search: login endpoint {}",
+        if login_enabled {
+            "enabled at POST /login"
+        } else {
+            "disabled (set NOVA_ADMIN_PASSWORD to enable)"
+        }
+    );
+    eprintln!(
+        "nova-veil-search: settings/config frontend {}",
+        if config_ui_enabled {
+            "enabled at GET / + /api/config (NOVA_CONFIG_UI); per-request config.toml reads active"
+        } else {
+            "disabled (set NOVA_CONFIG_UI=true to enable GET / + /api/config)"
+        }
+    );
+    axum::serve(listener, app.with_state(state)).await?;
     Ok(())
 }
 
@@ -212,16 +307,12 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
 
-    // In server-config mode every request must authenticate first — before any
-    // body read, gateway resolution, or DNS — so an unauthenticated caller can
-    // never reach the resolver or spend work on a request that would be denied.
-    if let Some(token) = state.api_token.as_deref() {
-        let authorized = bearer_token(&headers)
-            .map(|presented| constant_time_eq(presented, token))
-            .unwrap_or(false);
-        if !authorized {
-            return unauthorized_response();
-        }
+    // Every request must authenticate first — before any body read or DNS — so
+    // an unauthenticated caller can never reach the resolver or spend work on a
+    // request that would be denied. Accepts the master token or a login-issued
+    // session token.
+    if !authorize(&headers, &state).await {
+        return unauthorized_response();
     }
 
     // Read the body under a hard size cap, now that the permit is held.
@@ -233,12 +324,8 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
     // 1. Origin validation (DNS-rebinding defense). Absent Origin (non-browser
     //    clients) is allowed; a present Origin must be on the allowlist when one
     //    is configured. Enforced server-side, not via CORS alone.
-    if let Some(origin) = header_str(&headers, "origin") {
-        if let Some(allowed) = state.allowed_origins.as_ref() {
-            if !allowed.contains(origin) {
-                return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
-            }
-        }
+    if !origin_allowed(&headers, &state.allowed_origins) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
     // 2. Parse the JSON-RPC body ourselves so we control the error shape.
@@ -295,82 +382,15 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
         }
     }
 
-    // 4. Derive a per-request config from operator defaults + header keys, then
-    //    build a request-scoped, fully-credentialed service. In server-config
-    //    mode the operator defaults already carry the server's keys; in BYOK
-    //    mode they were stripped and only caller headers supply keys. Missing
+    // 4. Derive a per-request config from operator defaults (the server's own
+    //    keys) and build a request-scoped, fully-credentialed service. Missing
     //    required key -> 401 (fail-closed); OAuth -> 400.
-    let gateway = resolve_gateway(&headers);
-    let config = request_config(&state.base_env, &headers, gateway.as_deref());
-
-    // Build with the shared client FIRST so a missing/invalid key fails fast
-    // (401) BEFORE any gateway DNS: an unauthenticated request must never reach
-    // the resolver, else a bogus/slow `X-Grok-Base-Url` host would hold a
-    // concurrency permit until resolution (unauthenticated resolver DoS).
-    let service = match SearchService::for_request(
-        state.http_client.clone(),
-        state.cache.clone(),
-        config.clone(),
-    ) {
-        Ok(service) => service,
-        Err(err) => return for_request_error(id.clone(), err),
-    };
-
-    // Multi-gateway: a client may point at any Grok-compatible gateway via
-    // X-Grok-Base-Url (BYO gateway + matching key, same freedom as stdio). Its
-    // host is SSRF-validated AND the outbound connection is PINNED to the
-    // validated public IPs, so reqwest cannot re-resolve the hostname to an
-    // internal / metadata address between the check and the request
-    // (DNS-rebinding SSRF).
-    let service = if let Some(url) = gateway.as_deref() {
-        // Caller gateways must be HTTPS: the request carries the caller's bearer
-        // key, so a plaintext http:// gateway (typo/downgrade) would leak it on
-        // the wire. (URL-fetch tools still allow http; this is the gateway only.)
-        if !gateway_is_https(url) {
-            return json_rpc_error(
-                StatusCode::BAD_REQUEST,
-                id.clone(),
-                -32602,
-                "X-Grok-Base-Url must use https".to_string(),
-            );
-        }
-        // Cap concurrent gateway-host resolutions: a blocking getaddrinfo can
-        // outlive its 5s timeout, so bound how many run at once (the permit is
-        // held until the lookup returns) — a hung host can't pile up threads.
-        let dns_permit = match state.dns_limiter.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return json_rpc_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    id.clone(),
-                    -32603,
-                    "gateway resolver busy".to_string(),
-                )
-            }
-        };
-        let addrs = match validate_public_url(url, Some(dns_permit)).await {
-            Ok(addrs) => addrs,
-            Err((status, message)) => return json_rpc_error(status, id.clone(), -32602, message),
-        };
-        let client = match pinned_gateway_client(url, &addrs, state.timeout) {
-            Ok(client) => client,
-            Err((status, message)) => return json_rpc_error(status, id.clone(), -32602, message),
-        };
-        // The pinned, no-redirect client applies to the GROK provider only;
-        // Tavily/Firecrawl/source fetching keep the shared restricted client
-        // (which follows redirects, re-validating every hop).
-        match SearchService::for_request_with_grok_client(
-            state.http_client.clone(),
-            client,
-            state.cache.clone(),
-            config,
-        ) {
+    let config = request_config(&state.base_env, state.config_ui);
+    let service =
+        match SearchService::for_request(state.http_client.clone(), state.cache.clone(), config) {
             Ok(service) => service,
             Err(err) => return for_request_error(id.clone(), err),
-        }
-    } else {
-        service
-    };
+        };
 
     // 5. Clamp abusable numeric args (DoS) — HTTP path only; stdio is untouched.
     clamp_request_args(&mut request);
@@ -414,6 +434,212 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
             None => StatusCode::ACCEPTED.into_response(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic-compatible Messages endpoint (`POST /messages`).
+// ---------------------------------------------------------------------------
+// The official DeepSeek web-search backend (`@deepseek-ai/dsh-web-search-deepseek`)
+// is the only *zero-plugin* way to plug a custom search URL + key into DSH: its
+// `baseURL` / `apiKey` settings make it issue `POST {baseURL}/messages` with a
+// native `web_search_20250305` server tool and then read the reply's
+// `web_search_tool_result` blocks. This endpoint speaks that protocol on top of
+// nova's own search pipeline, so nova can replace the official backend with NO
+// DSH plugin — just `baseURL: http://host` + `apiKey: <GROK_MCP_API_TOKEN>`.
+//
+// Authentication reuses the same master bearer token as `/mcp` (server-config
+// mode). Provider keys still come from the server's own environment.
+
+/// The exact prompt prefix the DeepSeek provider prefixes every query with.
+const ANTHROPIC_QUERY_PREFIX: &str = "Perform a web search for the query: ";
+
+/// Extract the user's query from a Messages request body. DSH sends exactly one
+/// user turn whose `content` is a single `text` block; a string content or an
+/// array of text blocks are both accepted, joined, and the known prefix (when
+/// present) is stripped.
+fn extract_messages_query(body: &Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    let mut texts: Vec<String> = Vec::new();
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        match message.get("content") {
+            Some(Value::String(text)) => texts.push(text.clone()),
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            texts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let joined = texts.join("\n");
+    let query = joined
+        .strip_prefix(ANTHROPIC_QUERY_PREFIX)
+        .unwrap_or(joined.as_str())
+        .trim();
+    (!query.is_empty()).then(|| query.to_string())
+}
+
+/// Map a nova [`WebSearchOutput`] onto the Messages reply shape the DeepSeek
+/// provider reads: a `web_search_tool_result` block (url/title/page_age) plus a
+/// `text` block whose `citations[]` carry each source's excerpt as `cited_text`
+/// (the provider's snippet source — it never reads `web_search_result` items for
+/// snippets, only `text.citations`). The synthesized answer rides in the text
+/// block's `text` for any human reader; the provider itself consumes citations.
+fn messages_response(output: &WebSearchOutput) -> Value {
+    let mut items = Vec::new();
+    let mut citations = Vec::new();
+    for source in &output.sources {
+        if source.url.trim().is_empty() {
+            continue;
+        }
+        let mut item = serde_json::Map::new();
+        item.insert("type".to_string(), Value::from("web_search_result"));
+        item.insert("url".to_string(), Value::from(source.url.clone()));
+        if let Some(title) = source.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            item.insert("title".to_string(), Value::from(title.to_string()));
+        }
+        if let Some(date) = source
+            .published_date
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
+            item.insert("page_age".to_string(), Value::from(date.to_string()));
+        }
+        items.push(Value::Object(item));
+
+        if let Some(excerpt) = source
+            .description
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
+            citations.push(serde_json::json!({
+                "type": "char_location",
+                "cited_text": excerpt,
+                "url": source.url,
+                "start_char_index": 0,
+                "end_char_index": 0,
+            }));
+        }
+    }
+
+    serde_json::json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4()),
+        "type": "message",
+        "role": "assistant",
+        "model": "nova-veil-search",
+        "content": [
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": format!("toolu_{}", uuid::Uuid::new_v4()),
+                "content": items,
+            },
+            {
+                "type": "text",
+                "text": output.content,
+                "citations": citations,
+            },
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 0, "output_tokens": 0 },
+    })
+}
+
+/// An Anthropic Messages API error body (not JSON-RPC): the DeepSeek provider
+/// parses `error.message` from a non-2xx response.
+fn anthropic_error(status: StatusCode, message: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message },
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /messages`: adapt the DeepSeek backend's Messages request to a nova
+/// `web_search` call, then adapt the result back. Plain JSON in/out (the DSH
+/// provider never speaks SSE), so it stays separate from the /mcp streaming path.
+async fn messages_post(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    // Concurrency cap first, exactly like /mcp.
+    let _permit = match state.limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return (StatusCode::TOO_MANY_REQUESTS, "server at capacity").into_response(),
+    };
+
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+
+    // Same master token as /mcp. DSH sends both `authorization: Bearer` and
+    // `x-api-key`; accept either so a bare Anthropic client also works.
+    let presented = bearer_token(&headers).map(str::to_owned).or_else(|| {
+        header_str(&headers, "x-api-key")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    });
+    let authorized = presented.is_some_and(|value| constant_time_eq(&value, &state.api_token));
+    if !authorized {
+        return unauthorized_response();
+    }
+
+    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
+    };
+
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return anthropic_error(StatusCode::BAD_REQUEST, format!("parse error: {error}"))
+        }
+    };
+
+    let Some(query) = extract_messages_query(&body) else {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "messages[].content had no user text".to_string(),
+        );
+    };
+
+    // Reuse the per-request config + service exactly as /mcp does (server keys).
+    let config = request_config(&state.base_env, state.config_ui);
+    let service =
+        match SearchService::for_request(state.http_client.clone(), state.cache.clone(), config) {
+            Ok(service) => service,
+            Err(error) => {
+                let status = match &error {
+                    NovaVeilSearchError::MissingConfig(_) => StatusCode::UNAUTHORIZED,
+                    _ => StatusCode::BAD_REQUEST,
+                };
+                return anthropic_error(status, error.to_string());
+            }
+        };
+
+    let input = WebSearchInput {
+        query,
+        // The provider renders only sources (url/title/snippet/publishedAt), so
+        // "concise" (answer + source metadata, no inline content) is sufficient
+        // and the smallest transfer.
+        response_format: Some("concise".to_string()),
+        ..WebSearchInput::default()
+    };
+    let output = match service.web_search(input).await {
+        Ok(output) => output,
+        Err(error) => {
+            return anthropic_error(StatusCode::BAD_GATEWAY, error.to_string());
+        }
+    };
+
+    (StatusCode::OK, Json(messages_response(&output))).into_response()
 }
 
 /// Whether the client accepts an SSE stream (Streamable HTTP streaming mode).
@@ -616,32 +842,6 @@ async fn validate_public_url(
     Ok(resolved)
 }
 
-/// Build a restricted client whose DNS for the gateway `host` is pinned to
-/// `addrs` — the IPs [`validate_public_url`] just verified are public, at the
-/// gateway port. Connecting only to a pre-validated address closes the
-/// DNS-rebinding window between the SSRF check and the actual request.
-fn pinned_gateway_client(
-    url: &str,
-    addrs: &[std::net::IpAddr],
-    timeout: std::time::Duration,
-) -> Result<reqwest::Client, (StatusCode, String)> {
-    let parsed = url::Url::parse(url)
-        .map_err(|err| (StatusCode::BAD_REQUEST, format!("invalid url: {err}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or((StatusCode::BAD_REQUEST, "url has no host".to_string()))?;
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let socket_addrs: Vec<std::net::SocketAddr> = addrs
-        .iter()
-        .map(|ip| std::net::SocketAddr::new(*ip, port))
-        .collect();
-    Ok(crate::providers::http::build_restricted_client_pinned(
-        timeout,
-        host,
-        &socket_addrs,
-    ))
-}
-
 /// Map a `SearchService::for_request` construction error to a JSON-RPC HTTP
 /// response: a missing key -> 401 (fail-closed), OAuth / other -> 400.
 fn for_request_error(id: Value, err: NovaVeilSearchError) -> Response {
@@ -701,41 +901,35 @@ fn cap_u64(args: &mut serde_json::Map<String, Value>, key: &str, max: u64) {
     }
 }
 
-/// Build a per-request [`Config`] from the operator base env (secrets already
-/// stripped) overlaid with the caller's header-supplied keys.
-fn request_config(
-    base_env: &HashMap<String, String>,
-    headers: &HeaderMap,
-    gateway: Option<&str>,
-) -> Config {
-    let mut map = base_env.clone();
-    for (header_name, env_key) in HEADER_TO_ENV {
-        if let Some(value) = header_str(headers, header_name) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                map.insert((*env_key).to_string(), trimmed.to_string());
+/// Build a per-request [`Config`] from the server's own environment; keys never
+/// come from request headers. With `read_file` (settings frontend enabled via
+/// `NOVA_CONFIG_UI`) the full precedence chain (env > config.toml > defaults)
+/// applies, so persisted `config.toml` edits take effect on the next request
+/// without a restart. Otherwise env-only — the default, zero per-request disk I/O.
+fn request_config(base_env: &HashMap<String, String>, read_file: bool) -> Config {
+    if read_file {
+        Config::load_from(base_env.clone())
+    } else {
+        Config::from_env_map(base_env.clone())
+    }
+}
+
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Shared origin allowlist check (DNS-rebinding defense) for every browser-facing
+/// endpoint. Absent `Origin` (curl, non-browser) is allowed; a present `Origin`
+/// must be on the allowlist when one is configured.
+pub(crate) fn origin_allowed(headers: &HeaderMap, allowed: &Option<HashSet<String>>) -> bool {
+    if let Some(origin) = header_str(headers, "origin") {
+        if let Some(allowed) = allowed.as_ref() {
+            if !allowed.contains(origin) {
+                return false;
             }
         }
     }
-    if let Some(url) = gateway {
-        map.insert("GROK_SEARCH_URL".to_string(), url.to_string());
-    }
-    Config::from_env_map(map)
-}
-
-/// The Grok gateway a request targets via `X-Grok-Base-Url`, honored verbatim
-/// (BYO gateway). Absent/empty header -> `None` (the operator default gateway
-/// is used). The returned URL's host is SSRF-validated by the caller before
-/// use, so any *public* gateway is allowed but internal addresses are not.
-fn resolve_gateway(headers: &HeaderMap) -> Option<String> {
-    header_str(headers, "x-grok-base-url")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
+    true
 }
 
 /// Extract the bearer token from an `Authorization` header for server-config
@@ -767,9 +961,78 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Authorize a bearer token against the master token (constant-time) or the
+/// login-issued session store (sliding expiry).
+pub(crate) async fn authorize(headers: &HeaderMap, state: &AppState) -> bool {
+    let Some(presented) = bearer_token(headers) else {
+        return false;
+    };
+    if constant_time_eq(presented, &state.api_token) {
+        return true;
+    }
+    state
+        .sessions
+        .lock()
+        .await
+        .validate(presented, state.session_ttl)
+}
+
+/// `POST /login` — verifies admin credentials and issues a short-lived session
+/// token the web UI sends on subsequent `/mcp` calls. Body:
+/// `{"username": "...", "password": "..."}`. Disabled (404) when no
+/// `NOVA_ADMIN_PASSWORD` is configured.
+async fn login(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let Some(password) = state.admin_password.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), MAX_LOGIN_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+    };
+    let creds: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return unauthorized_response(),
+    };
+    let user = creds.get("username").and_then(Value::as_str).unwrap_or("");
+    let pass = creds.get("password").and_then(Value::as_str).unwrap_or("");
+
+    let user_ok = constant_time_eq(user, &state.admin_user);
+    let pass_ok = password_ok(pass, password);
+    if !(user_ok && pass_ok) {
+        // Slow the failure a touch to blunt brute-force attempts.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        return unauthorized_response();
+    }
+
+    let token = state.sessions.lock().await.issue(state.session_ttl);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "token": token,
+            "expires_in_seconds": state.session_ttl.as_secs(),
+        })),
+    )
+        .into_response()
+}
+
+/// Constant-time password compare, length-independent so the stored password's
+/// length is not revealed by a short-circuit.
+fn password_ok(presented: &str, stored: &str) -> bool {
+    let (presented, stored) = (presented.as_bytes(), stored.as_bytes());
+    let mut diff = presented.len() ^ stored.len();
+    let n = presented.len().max(stored.len());
+    for i in 0..n {
+        let p = presented.get(i).copied().unwrap_or(0);
+        let s = stored.get(i).copied().unwrap_or(0);
+        diff |= (p ^ s) as usize;
+    }
+    diff == 0
+}
+
 /// Plain `401` for a missing/incorrect bearer token. Carries `WWW-Authenticate`
 /// so standards-compliant clients and debug tools know to present a token.
-fn unauthorized_response() -> Response {
+pub(crate) fn unauthorized_response() -> Response {
     let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     response.headers_mut().insert(
         axum::http::header::WWW_AUTHENTICATE,
@@ -782,64 +1045,39 @@ fn json_rpc_error(status: StatusCode, id: Value, code: i64, message: String) -> 
     (status, Json(error_response(id, code, message))).into_response()
 }
 
-fn strip_secrets(mut env: HashMap<String, String>) -> HashMap<String, String> {
-    for key in SECRET_ENV_KEYS {
-        env.remove(*key);
+/// Per-request base env: the operator env minus non-config entries (the master
+/// token and the admin/session credentials). Keys stay — they always come from
+/// the server's own environment.
+fn request_base_env(base_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = base_env.clone();
+    for key in [
+        API_TOKEN_ENV,
+        ADMIN_USER_ENV,
+        ADMIN_PASSWORD_ENV,
+        SESSION_TTL_ENV,
+    ] {
+        env.remove(key);
     }
     env
 }
 
-/// Per-request base env. Server-config mode (token present) keeps the server's
-/// own provider keys so authenticated requests share them; BYOK mode (no token)
-/// strips every credential so only caller headers can supply keys. The operator
-/// token itself is never a request-config key in either mode.
-fn request_base_env(
-    base_env: &HashMap<String, String>,
-    api_token: Option<&str>,
-) -> HashMap<String, String> {
-    let mut env = if api_token.is_some() {
-        base_env.clone()
-    } else {
-        strip_secrets(base_env.clone())
-    };
-    env.remove(API_TOKEN_ENV);
-    env
-}
-
-/// Warn once at startup for every credential env var the operator set that this
-/// transport ignores. [`strip_secrets`] drops them from every per-request config
-/// by design — keys come from headers — but it did so silently, so a self-hoster
-/// who put `TAVILY_API_KEY` in their compose file got a server that looked
-/// configured while every request ran with no source fallback at all. Prints
-/// variable and header *names* only, never a value.
-fn warn_ignored_secret_env(env: &HashMap<String, String>) {
-    for key in SECRET_ENV_KEYS {
-        if !env.get(*key).is_some_and(|value| !value.trim().is_empty()) {
-            continue;
+/// Parse a boolean env flag (`1`/`true`/`yes`, case-insensitive). Absent or any
+/// other value is OFF.
+fn env_is_true(env: &HashMap<String, String>, key: &str) -> bool {
+    match env.get(key).map(|value| value.trim()) {
+        Some(value)
+            if value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes") =>
+        {
+            true
         }
-        match header_for_env(key) {
-            Some(header) => eprintln!(
-                "nova-veil-search: {key} is set in the server environment but the HTTP transport ignores it — callers must send the {header} request header instead"
-            ),
-            None => eprintln!(
-                "nova-veil-search: {key} is set in the server environment but the HTTP transport ignores it"
-            ),
-        }
+        _ => false,
     }
-}
-
-/// The request header that carries `env_key` on this transport, if any. Header
-/// names are matched case-insensitively; this returns the lowercase spelling
-/// [`HEADER_TO_ENV`] stores.
-fn header_for_env(env_key: &str) -> Option<&'static str> {
-    HEADER_TO_ENV
-        .iter()
-        .find(|(_, key)| *key == env_key)
-        .map(|(header, _)| *header)
 }
 
 /// Parse `GROK_MCP_ALLOWED_ORIGINS` (comma-separated) into an allowlist.
-/// Unset/empty -> `None` (no browser-origin restriction; keys are per-request).
+/// Unset/empty -> `None` (no browser-origin restriction).
 fn parse_allowed_origins(env: &HashMap<String, String>) -> Option<HashSet<String>> {
     let raw = env.get("GROK_MCP_ALLOWED_ORIGINS")?;
     let set: HashSet<String> = raw
@@ -855,39 +1093,12 @@ fn parse_allowed_origins(env: &HashMap<String, String>) -> Option<HashSet<String
     }
 }
 
-/// A caller-supplied gateway must be HTTPS: the request carries the caller's
-/// bearer key, so a plaintext `http://` gateway would leak it on the wire.
-/// (URL-fetch tools still allow `http`; this restriction is gateway-only.)
-fn gateway_is_https(url: &str) -> bool {
-    url::Url::parse(url)
-        .map(|parsed| parsed.scheme() == "https")
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn base() -> HashMap<String, String> {
         HashMap::new()
-    }
-
-    // Every stripped credential that has a header equivalent must be able to
-    // name it, so the startup warning tells the operator what to do instead of
-    // just what was ignored.
-    #[test]
-    fn header_for_env_names_the_credential_headers() {
-        assert_eq!(header_for_env("TAVILY_API_KEY"), Some("x-tavily-api-key"));
-        assert_eq!(
-            header_for_env("FIRECRAWL_API_KEY"),
-            Some("x-firecrawl-api-key")
-        );
-        assert_eq!(
-            header_for_env("GROK_SEARCH_API_KEY"),
-            Some("x-grok-api-key")
-        );
-        // Stripped but header-less: the warning falls back to the short form.
-        assert_eq!(header_for_env("GROK_SEARCH_AUTH_FILE"), None);
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -902,109 +1113,115 @@ mod tests {
     }
 
     #[test]
-    fn request_config_overlays_header_keys() {
-        let cfg = request_config(
-            &base(),
-            &headers(&[
-                ("X-Grok-Api-Key", "xai-caller"),
-                ("X-Tavily-Api-Key", "tvly-caller"),
-                ("X-Grok-Model", "grok-caller-model"),
-            ]),
-            None,
-        );
-        assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-caller"));
-        assert_eq!(cfg.tavily_api_key.as_deref(), Some("tvly-caller"));
-        assert_eq!(cfg.grok_model, "grok-caller-model");
-        // Absent model header -> operator default survives.
-        let default_cfg = request_config(&base(), &headers(&[]), None);
-        assert_eq!(default_cfg.grok_model, "grok-4-1-fast-reasoning");
+    fn request_config_uses_server_env_only() {
+        // Caller headers never carry keys: config seeds from the server's own
+        // env, and an absent model falls back to the built-in default.
+        let mut env = base();
+        env.insert("GROK_SEARCH_API_KEY".to_string(), "xai-server".to_string());
+        env.insert("TAVILY_API_KEY".to_string(), "tvly-server".to_string());
+        let cfg = request_config(&env, false);
+        assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-server"));
+        assert_eq!(cfg.tavily_api_key.as_deref(), Some("tvly-server"));
+        assert_eq!(cfg.grok_model, "grok-4-1-fast-reasoning");
     }
 
     #[test]
-    fn request_config_applies_gateway_override() {
-        let cfg = request_config(
-            &base(),
-            &headers(&[("X-Grok-Api-Key", "xai-caller")]),
-            Some("https://api.x.ai"),
-        );
-        assert_eq!(cfg.grok_api_url, "https://api.x.ai/v1");
-    }
-
-    #[test]
-    fn resolve_gateway_reads_header_verbatim() {
-        // No header -> operator default (None).
-        assert_eq!(resolve_gateway(&headers(&[])), None);
-        // Any gateway is honored verbatim (allowlist removed); the host is
-        // SSRF-validated separately in the request path.
-        assert_eq!(
-            resolve_gateway(&headers(&[("X-Grok-Base-Url", "https://api.x.ai")])).as_deref(),
-            Some("https://api.x.ai"),
-        );
-        // Empty / whitespace-only header -> None.
-        assert_eq!(
-            resolve_gateway(&headers(&[("X-Grok-Base-Url", "   ")])),
-            None
-        );
-    }
-
-    #[test]
-    fn request_config_never_inherits_server_secret() {
-        // Even if the operator base env carries a key, it is stripped so it can
-        // never leak into a tenant request.
-        let mut server_env = HashMap::new();
-        server_env.insert("GROK_SEARCH_API_KEY".to_string(), "xai-SERVER".to_string());
-        let sanitized = strip_secrets(server_env);
-        let cfg = request_config(&sanitized, &headers(&[]), None);
-        assert_eq!(
-            cfg.grok_api_key, None,
-            "server key must not survive into a keyless request"
-        );
-    }
-
-    #[test]
-    fn strip_secrets_removes_every_secret_key() {
-        let mut env = HashMap::new();
-        for key in SECRET_ENV_KEYS {
-            env.insert((*key).to_string(), "secret".to_string());
-        }
-        env.insert("GROK_SEARCH_TIMEOUT_SECONDS".to_string(), "30".to_string());
-        let stripped = strip_secrets(env);
-        for key in SECRET_ENV_KEYS {
-            assert!(!stripped.contains_key(*key), "{key} not stripped");
-        }
-        // Non-secret operator knobs survive.
-        assert_eq!(
-            stripped
-                .get("GROK_SEARCH_TIMEOUT_SECONDS")
-                .map(String::as_str),
-            Some("30")
-        );
-    }
-
-    #[test]
-    fn request_base_env_strips_secrets_in_byok_mode() {
+    fn request_base_env_keeps_keys_but_drops_non_config_entries() {
         let mut env = base();
         env.insert("TAVILY_API_KEY".to_string(), "tvly-server".to_string());
         env.insert("GROK_SEARCH_TIMEOUT_SECONDS".to_string(), "30".to_string());
-        let out = request_base_env(&env, None);
-        assert!(!out.contains_key("TAVILY_API_KEY"));
+        env.insert("GROK_MCP_API_TOKEN".to_string(), "s3cret".to_string());
+        env.insert("NOVA_ADMIN_USER".to_string(), "admin".to_string());
+        env.insert("NOVA_ADMIN_PASSWORD".to_string(), "hunter2".to_string());
+        env.insert("NOVA_SESSION_TTL_SECONDS".to_string(), "3600".to_string());
+        let out = request_base_env(&env);
+        assert_eq!(
+            out.get("TAVILY_API_KEY").map(String::as_str),
+            Some("tvly-server"),
+            "server key must survive into the request config"
+        );
         assert_eq!(
             out.get("GROK_SEARCH_TIMEOUT_SECONDS").map(String::as_str),
             Some("30")
         );
+        for key in [
+            "GROK_MCP_API_TOKEN",
+            "NOVA_ADMIN_USER",
+            "NOVA_ADMIN_PASSWORD",
+            "NOVA_SESSION_TTL_SECONDS",
+        ] {
+            assert!(!out.contains_key(key), "{key} must not be a config key");
+        }
     }
 
     #[test]
-    fn request_base_env_keeps_secrets_in_server_config_mode_but_drops_token() {
+    fn env_is_true_parses_opt_in_flag() {
         let mut env = base();
-        env.insert("TAVILY_API_KEY".to_string(), "tvly-server".to_string());
-        env.insert("GROK_MCP_API_TOKEN".to_string(), "s3cret".to_string());
-        let out = request_base_env(&env, Some("s3cret"));
-        assert_eq!(
-            out.get("TAVILY_API_KEY").map(String::as_str),
-            Some("tvly-server")
+        assert!(!env_is_true(&env, "NOVA_CONFIG_UI"));
+        for value in ["1", "true", "yes", "TRUE", "Yes"] {
+            env.insert("NOVA_CONFIG_UI".to_string(), value.to_string());
+            assert!(
+                env_is_true(&env, "NOVA_CONFIG_UI"),
+                "{value:?} should be on"
+            );
+        }
+        for value in ["0", "false", "no", "on", "", "2", "random"] {
+            env.insert("NOVA_CONFIG_UI".to_string(), value.to_string());
+            assert!(
+                !env_is_true(&env, "NOVA_CONFIG_UI"),
+                "{value:?} should be off"
+            );
+        }
+    }
+
+    #[test]
+    fn request_config_gates_file_read_on_config_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "grok_model = \"from-file\"\n").unwrap();
+
+        let mut env = base();
+        env.insert(
+            "GROK_SEARCH_CONFIG".to_string(),
+            cfg_path.to_string_lossy().to_string(),
         );
-        assert!(!out.contains_key("GROK_MCP_API_TOKEN"));
+
+        // Default (config UI OFF): env-only — the file is never opened.
+        let env_only = request_config(&env, false);
+        assert_eq!(
+            env_only.config_file_state,
+            crate::config::ConfigFileState::Absent
+        );
+        assert_ne!(env_only.grok_model, "from-file");
+
+        // Config UI ON: file is merged (env > file > defaults).
+        let merged = request_config(&env, true);
+        assert_eq!(
+            merged.config_file_state,
+            crate::config::ConfigFileState::Loaded
+        );
+        assert_eq!(merged.grok_model, "from-file");
+    }
+
+    #[test]
+    fn password_ok_compares_length_independently() {
+        assert!(password_ok("hunter2", "hunter2"));
+        assert!(!password_ok("hunter2", "hunter3"));
+        assert!(!password_ok("hunter", "hunter2"));
+        assert!(!password_ok("", "hunter2"));
+        assert!(password_ok("", ""));
+    }
+
+    #[test]
+    fn session_store_issues_and_validates_tokens() {
+        let ttl = std::time::Duration::from_secs(3600);
+        let mut store = SessionStore::new();
+        let token = store.issue(ttl);
+        assert!(store.validate(&token, ttl));
+        assert!(store.validate("not-issued", ttl) == false);
+        // Expired tokens are rejected and pruned.
+        let expired = store.issue(std::time::Duration::ZERO);
+        assert!(!store.validate(&expired, ttl));
     }
 
     #[test]
@@ -1081,14 +1298,6 @@ mod tests {
             vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
         );
         assert!(validate_public_url("http://8.8.8.8/", None).await.is_ok());
-    }
-
-    #[test]
-    fn gateway_is_https_rejects_plaintext() {
-        assert!(gateway_is_https("https://api.x.ai/v1"));
-        assert!(!gateway_is_https("http://api.x.ai/v1"));
-        assert!(!gateway_is_https("ftp://api.x.ai"));
-        assert!(!gateway_is_https("not a url"));
     }
 
     #[test]
