@@ -6,8 +6,8 @@ name: Docker
 # CI runners). Pushes on every push to main and on manual dispatch; PRs build
 # only (no login, no push) to validate the Dockerfile/dist layout.
 #
-# Tags produced: <image>:main and <image>:sha-<short>.
-# `:latest` and `:<semver>` stay owned by release.yml (tag push v*).
+# Tags produced: <image>:latest, <image>:main and <image>:sha-<short>.
+# `:<semver>` stays owned by release.yml (tag push v*).
 on:
   push:
     branches: [main]
@@ -115,8 +115,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
+          # latest=auto is the default: metadata-action adds `:latest` on push to
+          # the default branch (main), alongside `:main` and `:sha-<short>`.
           tags: |
             type=ref,event=branch
             type=sha,format=short,prefix=sha-
