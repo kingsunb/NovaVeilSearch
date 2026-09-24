@@ -1,0 +1,9 @@
+pub const XAI_OAUTH_ISSUER: &str = "https://auth.x.ai";
+pub const XAI_OAUTH_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+pub const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+pub const XAI_OAUTH_REDIRECT_HOST: &str = "127.0.0.1";
+pub const XAI_OAUTH_REDIRECT_PORT: u16 = 56121;
+pub const XAI_OAUTH_REDIRECT_PATH: &str = "/callback";
+pub const XAI_ACCESS_TOKEN_REFRESH_SKEW_SECONDS: u64 = 120;
+pub const DEFAULT_XAI_OAUTH_BASE_URL: &str = "https://api.x.ai/v1";

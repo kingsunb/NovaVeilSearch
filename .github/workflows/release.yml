@@ -1,0 +1,315 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: nova-veil-search
+            asset_name: nova-veil-search_Linux_x86_64.tar.gz
+            universal: false
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: nova-veil-search
+            asset_name: nova-veil-search_Linux_aarch64.tar.gz
+            universal: false
+            cross: true
+          # HTTP server builds (`--features http`, release-http profile): the
+          # Streamable HTTP transport is compile-time gated, so the default
+          # assets above cannot serve remote MCP. These two Linux assets are
+          # what self-hosters (and the GHCR image below) run; macOS/Windows
+          # stay stdio-only on purpose.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: nova-veil-search
+            asset_name: nova-veil-search-http_Linux_x86_64.tar.gz
+            universal: false
+            cross: false
+            http: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: nova-veil-search
+            asset_name: nova-veil-search-http_Linux_aarch64.tar.gz
+            universal: false
+            cross: true
+            http: true
+          - target: universal-apple-darwin
+            os: macos-latest
+            artifact_name: nova-veil-search
+            asset_name: nova-veil-search_Darwin_universal.tar.gz
+            universal: true
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: nova-veil-search.exe
+            asset_name: nova-veil-search_Windows_x86_64.zip
+            universal: false
+            cross: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: nova-veil-search.exe
+            asset_name: nova-veil-search_Windows_aarch64.zip
+            universal: false
+            cross: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (Universal macOS)
+        if: matrix.universal == true
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Setup Rust
+        if: matrix.universal != true
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@cross
+
+      - name: Inject version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          echo "Injecting version $VERSION into Cargo.toml"
+          python3 - "$VERSION" <<'PY'
+          import sys, re, pathlib
+          v = sys.argv[1]
+          p = pathlib.Path("Cargo.toml")
+          t = p.read_text()
+          new_t, n = re.subn(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{v}"', t, count=1)
+          if n != 1:
+              raise SystemExit("could not find version field in Cargo.toml")
+          p.write_text(new_t)
+          PY
+          cargo update -p nova-veil-search
+
+      - name: Build with cross
+        if: matrix.cross == true
+        run: cross build ${{ matrix.http == true && '--profile release-http --features http' || '--release' }} --target ${{ matrix.target }} --locked
+
+      - name: Build universal macOS
+        if: matrix.universal == true
+        run: |
+          cargo build --release --target x86_64-apple-darwin --locked
+          cargo build --release --target aarch64-apple-darwin --locked
+          lipo -create -output target/release/${{ matrix.artifact_name }} \
+            target/x86_64-apple-darwin/release/${{ matrix.artifact_name }} \
+            target/aarch64-apple-darwin/release/${{ matrix.artifact_name }}
+
+      - name: Build
+        if: matrix.universal != true && matrix.cross != true
+        run: cargo build ${{ matrix.http == true && '--profile release-http --features http' || '--release' }} --target ${{ matrix.target }} --locked
+
+      - name: Package Unix
+        if: matrix.os != 'windows-latest'
+        run: |
+          # http builds land in the release-http profile directory.
+          PROFILE_DIR=${{ matrix.http == true && 'release-http' || 'release' }}
+          if [ "${{ matrix.universal }}" = "true" ]; then
+            cd target/release
+            tar czf ../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          else
+            cd target/${{ matrix.target }}/$PROFILE_DIR
+            tar czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          fi
+
+      - name: Package Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path ${{ matrix.artifact_name }} -DestinationPath ../../../${{ matrix.asset_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts and checksums
+        run: |
+          cd artifacts
+          mkdir -p ../flat
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} ../flat/ \;
+          cd ../flat
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+
+      - name: Generate changelog
+        run: |
+          CURRENT_TAG=${GITHUB_REF#refs/tags/}
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -n1 || true)
+          echo "## What's Changed" > changelog.md
+          echo "" >> changelog.md
+          if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$CURRENT_TAG" ]; then
+            git log ${PREVIOUS_TAG}..${CURRENT_TAG} --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+            echo "" >> changelog.md
+            echo "" >> changelog.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}" >> changelog.md
+          else
+            git log --pretty=format:"- %s (%h)" --no-merges >> changelog.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: changelog.md
+          files: |
+            flat/*.tar.gz
+            flat/*.zip
+            flat/SHA256SUMS
+
+  publish-image:
+    name: Publish multi-arch image to GHCR
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download http binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nova-veil-search-http_Linux_*.tar.gz
+          path: http-artifacts
+
+      # Dockerfile.deploy COPYs dist/${TARGETPLATFORM}/nova-veil-search; its
+      # .dockerignore keeps the build context to dist/ alone.
+      - name: Lay out dist/ for Dockerfile.deploy
+        run: |
+          mkdir -p dist/linux/amd64 dist/linux/arm64
+          tar -xzf http-artifacts/nova-veil-search-http_Linux_x86_64.tar.gz/nova-veil-search-http_Linux_x86_64.tar.gz -C dist/linux/amd64
+          tar -xzf http-artifacts/nova-veil-search-http_Linux_aarch64.tar.gz/nova-veil-search-http_Linux_aarch64.tar.gz -C dist/linux/arm64
+          chmod 0755 dist/linux/amd64/nova-veil-search dist/linux/arm64/nova-veil-search
+          ls -lR dist
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/nova-veil-search
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      # The image always builds (validating Dockerfile.deploy + dist layout
+      # even on workflow_dispatch runs); pushing is tag-gated.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.deploy
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  sync-main:
+    name: Sync version bump back to main
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply version to all manifests
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          echo "Applying $VERSION to source manifests"
+          python3 - "$VERSION" <<'PY'
+          import sys, re, pathlib
+          v = sys.argv[1]
+          p = pathlib.Path("Cargo.toml")
+          t = p.read_text()
+          new_t, n = re.subn(r'(?m)^version\s*=\s*"[^"]+"', f'version = "{v}"', t, count=1)
+          if n != 1:
+              raise SystemExit("could not find version field in Cargo.toml")
+          p.write_text(new_t)
+          PY
+          cargo update -p nova-veil-search
+
+      - name: Commit and push to main
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "main already at $VERSION, nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore: sync manifests to $VERSION [skip ci]"
+          git pull --rebase origin main
+          git push origin main

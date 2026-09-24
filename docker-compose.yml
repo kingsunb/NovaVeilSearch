@@ -1,0 +1,63 @@
+# One-command deploy: nova-veil-search behind Caddy with automatic HTTPS.
+#
+#   MCP_HOSTNAME=your-domain.example.com docker compose up -d --build
+#
+# Set MCP_HOSTNAME to your own domain (A record -> your server IP) or your VPS's
+# dash-joined-IP sslip.io name (e.g. 203-0-113-5.sslip.io). Keep it out of the
+# repo — pass it via the environment or a local .env file (git-ignored).
+#
+# Endpoint: https://<MCP_HOSTNAME>/nova-veil-search/mcp
+#
+# Two credential modes, picked by whether GROK_MCP_API_TOKEN is set:
+#   • server-config (GROK_MCP_API_TOKEN set — the default for a shared instance):
+#     put the provider keys HERE; every client connects with only
+#     `Authorization: Bearer <token>`. No per-client keys.
+#   • bring-your-own-key (token unset/empty): leave all *_API_KEY blank here and
+#     each client sends its own keys as X-*-Api-Key request headers (the server
+#     strips any server-side keys in this mode).
+services:
+  nova-veil-search:
+    build: .
+    image: nova-veil-search:latest
+    restart: unless-stopped
+    environment:
+      GROK_MCP_BIND: "0.0.0.0:8080"
+      # Server-config mode: a shared token + server-held provider keys.
+      # Set a long random token and fill the keys you use.
+      GROK_MCP_API_TOKEN: "${GROK_MCP_API_TOKEN:-change-me-to-a-long-random-token}"
+      GROK_SEARCH_API_KEY: "${GROK_SEARCH_API_KEY:-}"
+      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      # Optional extra source providers: uncomment and fill as needed.
+      # EXA_API_KEY: "${EXA_API_KEY:-}"
+      # FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY:-}"
+      # TINYFISH_API_KEY: "${TINYFISH_API_KEY:-}"
+      # GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      # Operator-fixed gateway/model defaults (optional).
+      # GROK_SEARCH_URL: "https://api.x.ai"
+      # GROK_SEARCH_MODEL: "grok-4-1-fast-reasoning"
+      # To serve BYOK instead, clear GROK_MCP_API_TOKEN above and leave every
+      # *_API_KEY value empty.
+    expose:
+      - "8080"
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - nova-veil-search
+    environment:
+      MCP_HOSTNAME: "${MCP_HOSTNAME:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

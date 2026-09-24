@@ -1,0 +1,12 @@
+{
+  "query": {
+    "pages": {
+      "25433": {
+        "pageid": 25433,
+        "ns": 0,
+        "title": "Rust (programming language)",
+        "extract": "Rust is a multi-paradigm, general-purpose programming language. It was designed for performance and safety, especially safe concurrency and safe memory management.\n\nRust achieves memory safety without a garbage collector."
+      }
+    }
+  }
+}

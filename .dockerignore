@@ -1,0 +1,14 @@
+target
+# Pre-built deploy binaries; only Dockerfile.deploy needs them (it has its
+# own Dockerfile.deploy.dockerignore that keeps dist/ in)
+dist
+.git
+.github
+docs
+*.md
+!README.md
+.claude
+
+# Local env files (may hold secrets) — never send them to the build context
+.env
+.env.*

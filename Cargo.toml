@@ -1,0 +1,62 @@
+[package]
+name = "nova-veil-search"
+version = "0.1.26"
+edition = "2021"
+rust-version = "1.78"
+description = "Rust MCP server for Grok web search and Tavily-backed source retrieval"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kingsunb/NovaVeilSearch"
+homepage = "https://github.com/kingsunb/NovaVeilSearch"
+keywords = ["mcp", "grok", "tavily", "firecrawl", "search"]
+categories = ["command-line-utilities", "web-programming"]
+
+[lib]
+name = "nova_veil_search"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nova-veil-search"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "gzip"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+getrandom = "0.3"
+ring = "0.17"
+url = "2"
+percent-encoding = "2"
+quick-xml = { version = "0.37", default-features = false, features = ["encoding"] }
+axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json"] }
+
+[features]
+# Native Streamable HTTP transport (remote, multi-tenant, bring-your-own-key).
+# OFF by default: the default build stays a pure stdio binary — no axum, no
+# multi-threaded runtime — so local stdio users are entirely unaffected. The
+# server build opts in with `--features http`.
+http = ["dep:axum", "tokio/net", "tokio/rt-multi-thread"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Server / HTTP build: same size optimizations as `release`, but panic=unwind so
+# a single request handler panic cannot abort the whole multi-tenant process
+# (the panicking task's connection is dropped; the server keeps serving). Build
+# the deployable server binary with `--profile release-http --features http`.
+[profile.release-http]
+inherits = "release"
+panic = "unwind"

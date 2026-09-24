@@ -1,0 +1,370 @@
+# NovaVeilSearch
+
+![NovaVeilSearch product banner](assets/nova-veil-search-banner.png)
+
+**A lightweight Rust MCP server for Grok / OpenAI‑compatible web search, backed by an ordered source chain — Tavily, Exa, TinyFish, Firecrawl — for supplemental sources, fetch, and map.**
+
+`nova-veil-search` is an **MCP server** — run it locally over **stdio** (your client launches it; you do not run it directly) or as a **remote Streamable HTTP** service for mobile / multi‑device access (see [self-hosting](#self-hosting-remote-http)). It exposes one set of tools (`web_search`, `get_sources`, `web_fetch`, `web_map`, `doctor`) and supports two upstream transports so you can plug into either xAI's official API or any OpenAI‑compatible relay.
+
+---
+
+## Features
+
+- 🔎 **Live web search** with cited sources, cached for follow‑up `get_sources` calls. Opt‑in `include_content` enriches the top sources with full extracted text in one call.
+- 📏 **Response budgeting** — `web_search` keeps responses inside agent context limits: only the top `max_inline_sources` carry inline text, a whole‑response char budget (`response_max_chars`, default 45k — sized to stay under the MCP client token ceiling after JSON serialization) trims tail sources with recovery notes, `response_format: "concise" | "detailed"` picks the payload size, and `get_sources` pages through cached sources with `offset`/`limit`. The session cache always keeps full content.
+- 🧩 **Structured `web_fetch`** — GitHub issues/PRs/releases, StackExchange/MathOverflow, arXiv, and Wikipedia URLs are parsed by specialist extractors into clean Markdown (title, state/labels, release notes, accepted‑answer ordering, abstracts, vote‑sorted answers). **Specialist extractors need no API key.** Anything else falls back to the generic source chain (Tavily → Exa → TinyFish → Firecrawl, as configured) — so with **no source provider configured, ordinary URLs cannot be fetched at all**, only the specialist families above. Output carries `source_type` and a `fallback_reason` when a specialist was skipped.
+- 🔀 **Two transports** — native xAI Responses (`/v1/responses`) **or** any OpenAI‑compatible chat‑completions gateway (`/v1/chat/completions`). Pick by env vars; no flag.
+- 🔐 **Optional Grok OAuth mode** — `login/status/logout` commands store a local xAI OAuth token for Responses auth, so the MCP server can run without `GROK_SEARCH_API_KEY`.
+- 🌐 **Optional remote mode** — build with `--features http` to serve the same tools over **Streamable HTTP** (multi‑tenant, bring‑your‑own‑key via request headers) for mobile / multi‑device access. See [self-hosting](#self-hosting-remote-http).
+- 📥 **Pluggable source chain** — supplemental sources and generic fetch walk an ordered provider chain: **Tavily** (RAG‑tuned search + extract + map), **Exa** (semantic search, native domain/date filters), **TinyFish** (free search + JS‑rendering fetch), **Firecrawl** (robust scrape fallback). First provider with results wins; `GROK_SEARCH_SOURCE_PROVIDERS` reorders. `TAVILY_API_KEY` accepts a comma‑separated key list — keys rotate round‑robin with automatic failover on rate/quota errors.
+- 🐦 **Optional X/Twitter search** via `x_search` (Responses transport only).
+- 🚦 **Concurrent stdio requests** — up to 8 tool calls are handled at once; anything beyond that queues rather than being refused. Responses come back in completion order, paired to requests by JSON‑RPC `id`.
+- 🩺 **`doctor`** — connectivity probe + redacted config in one tool call, including whether your config file was found, loaded, or rejected (and why).
+- 🗂 **Single global config file** so multiple MCP clients share one set of keys.
+
+---
+
+## Install
+
+Grab a prebuilt binary from the [latest release](https://github.com/kingsunb/NovaVeilSearch/releases/latest),
+or build from source ([see below](#build-from-source)). The `nova-veil-search` command is what your
+MCP client launches.
+
+---
+
+## Quick Start
+
+Run locally over stdio:
+
+1. After installing, add this MCP server entry to your client config:
+
+   ```json
+   {
+     "nova-veil-search": {
+       "command": "nova-veil-search",
+       "args": [],
+       "env": {
+         "GROK_SEARCH_API_KEY": "",
+         "GROK_SEARCH_URL": "",
+         "GROK_SEARCH_MODEL": "grok-4.20-fast",
+         "TAVILY_API_KEY": "",
+         "TAVILY_API_URL": "https://api.tavily.com",
+         "FIRECRAWL_API_KEY": ""
+       }
+     }
+   }
+   ```
+
+   For Codex TOML config:
+
+   ```toml
+   [mcp_servers.nova-veil-search]
+   type = "stdio"
+   command = "nova-veil-search"
+
+   [mcp_servers.nova-veil-search.env]
+   FIRECRAWL_API_KEY = ""
+   GROK_SEARCH_API_KEY = ""
+   GROK_SEARCH_MODEL = "grok-4.20-fast"
+   GROK_SEARCH_URL = ""
+   TAVILY_API_KEY = ""
+   TAVILY_API_URL = "https://api.tavily.com"
+   ```
+
+   Put your real keys in the empty values. If your client expects a top-level `mcpServers` / `mcp_servers` object, place the `nova-veil-search` entry under that section.
+
+2. Optional: scaffold a shared global config file instead of duplicating env blocks in every MCP client:
+
+   ```bash
+   nova-veil-search --init
+   $EDITOR ~/.config/nova-veil-search/config.toml
+   ```
+
+3. Verify:
+
+   ```text
+   Ask your assistant: "call doctor"
+   ```
+
+   Successful output shows `reachable: true` for each enabled upstream and `transport: Responses` (or `ChatCompletions`).
+
+---
+
+## Configuration
+
+The MCP **transport** decides how config reaches the server — same values, different channel (forced by the transport, not a project setting):
+
+- **stdio (local):** environment variables — the `env` block in your MCP client config.
+- **remote HTTP:** per-request HTTP headers — the server stores no keys.
+
+| Setting | stdio env | remote header |
+|---|---|---|
+| Grok API key | `GROK_SEARCH_API_KEY` | `X-Grok-Api-Key` |
+| Grok gateway URL | `GROK_SEARCH_URL` | `X-Grok-Base-Url` |
+| Grok model | `GROK_SEARCH_MODEL` | `X-Grok-Model` |
+| Tavily API key | `TAVILY_API_KEY` | `X-Tavily-Api-Key` |
+| Firecrawl API key | `FIRECRAWL_API_KEY` | `X-Firecrawl-Api-Key` |
+| TinyFish API key | `TINYFISH_API_KEY` | `X-Tinyfish-Api-Key` |
+| Exa API key | `EXA_API_KEY` | `X-Exa-Api-Key` |
+| GitHub token | `GITHUB_TOKEN` | `X-GitHub-Token` |
+
+The tables below use env-key names (they also drive `config.toml` / stdio); on the remote transport send the header from the row above. Full reference and per-transport examples: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#configuration-channels-stdio-env-vs-remote-headers). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports.
+
+### A. Native Grok Responses (default)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GROK_SEARCH_AUTH_MODE` | `api_key` | `api_key` uses `GROK_SEARCH_API_KEY`; `oauth` uses the local token from `nova-veil-search login`. |
+| `GROK_SEARCH_API_KEY` | — *(required in `api_key` mode)* | Bearer token for the Grok / xAI gateway. |
+| `GROK_SEARCH_AUTH_FILE` | `<home>/.config/nova-veil-search/auth.json` | Optional OAuth token file override. |
+| `GROK_SEARCH_URL` | `https://api.x.ai` | Root, `/v1`, or full‑endpoint URL. |
+| `GROK_SEARCH_MODEL` | `grok-4-1-fast-reasoning` | Model name. |
+| `GROK_SEARCH_WEB_SEARCH` | `true` | Offer `web_search` tool to Grok. |
+| `GROK_SEARCH_X_SEARCH` | `false` | Offer `x_search` tool (X/Twitter) to Grok. |
+
+Verified upstream: **xAI** (`https://api.x.ai`, both tools). Other Grok‑compatible gateways work with a matching key; `x_search` availability depends on the gateway.
+
+OAuth mode is a single-binary flow:
+
+```bash
+nova-veil-search login
+nova-veil-search status
+nova-veil-search logout
+```
+
+Then configure your MCP client with:
+
+```toml
+[mcp_servers.nova-veil-search]
+command = "nova-veil-search"
+
+[mcp_servers.nova-veil-search.env]
+GROK_SEARCH_AUTH_MODE = "oauth"
+GROK_SEARCH_MODEL = "grok-4.3"
+GROK_SEARCH_WEB_SEARCH = "true"
+```
+
+OAuth mode reuses Hermes' xAI OAuth client id and stores `auth.json` locally. That may violate xAI terms or affect your account; do not share the token file. If xAI changes or blocks that OAuth flow, switch back to `api_key` mode.
+
+### B. OpenAI‑compatible chat/completions
+
+Activate by setting the URL **and** key while leaving `GROK_SEARCH_API_KEY` unset. Suitable for any OpenAI‑compatible relay (one‑api, vLLM, LiteLLM, marybrown, Perplexity‑style gateways, etc.).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_COMPATIBLE_API_URL` | — | Root, `/v1`, or full‑endpoint URL. |
+| `OPENAI_COMPATIBLE_API_KEY` | — | Bearer token for the relay. |
+| `OPENAI_COMPATIBLE_MODEL` | falls back to `GROK_SEARCH_MODEL` | Model name to send. |
+
+Notes:
+
+- `GROK_SEARCH_WEB_SEARCH=true` (default) appends `tools:[{"type":"web_search"}]` to the payload. Relays that auto‑search server‑side simply ignore it.
+- `GROK_SEARCH_X_SEARCH=true` is **silently ignored** on this transport (a one‑line stderr warning prints at startup). `x_search` only exists on the Responses API.
+- Source extraction reads four parallel paths and de‑duplicates by URL: OpenAI `annotations[].url_citation`, Perplexity‑style `citations`, top‑level `search_sources[]`, and inline `[[n]](url)` markers.
+
+### Source providers (shared)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TAVILY_API_KEY` | — *(required for `web_map`)* | Tavily key. Comma‑separated list rotates round‑robin with failover on HTTP 401/403/429/432/433. |
+| `TAVILY_API_URL` | `https://api.tavily.com` | Tavily base. |
+| `GROK_SEARCH_EXTRA_SOURCES` | `3` | Extra chain‑served sources after a Grok answer (`0` disables). |
+| `GROK_SEARCH_FALLBACK_SOURCES` | `5` | Fallback source count when the AI step can't verify itself. |
+| `FIRECRAWL_API_KEY` | unset | Enables Firecrawl as `web_fetch` / source fallback. |
+| `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Firecrawl base; defaults to `/v2`, preserving explicit `/v1` or `/v2` and gateway prefixes. |
+| `TINYFISH_API_KEY` | unset | Enables TinyFish (free search + JS‑rendering fetch) in the chain. |
+| `EXA_API_KEY` | unset | Enables Exa (semantic search, native filters) in the chain. |
+| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Explicit chain order, e.g. `tinyfish,tavily,firecrawl`. Unset = canonical order `tavily, exa, tinyfish, firecrawl` over configured providers. |
+| `GROK_SEARCH_CACHE_SIZE` | `256` | Max cached `web_search` sessions. |
+| `GROK_SEARCH_TIMEOUT_SECONDS` | `60` | HTTP timeout for all upstreams. |
+| `GROK_SEARCH_FETCH_MAX_CHARS` | unset | Default char cap on `web_fetch`. |
+| `GROK_SEARCH_MAX_INLINE_SOURCES` | `5` | Max `web_search` sources carrying inline content; the rest are metadata‑only. |
+| `GROK_SEARCH_RESPONSE_MAX_CHARS` | `45000` | Whole‑response char budget for `web_search`; over‑budget output is truncated tail‑first with `truncated: true`. Sized to keep the serialized result under the MCP client token ceiling (Claude Code default `MAX_MCP_OUTPUT_TOKENS=25000`). |
+
+### Source extraction (`web_fetch` specialists / `web_search` enrichment)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GITHUB_TOKEN` | unset | Authenticates GitHub issue/PR/release fetches (higher API rate limit; private repos). Specialist works unauthenticated but is rate‑limited. |
+| `GROK_SEARCH_SOURCE_MAX_ANSWERS` | `5` | StackExchange answers rendered before folding. |
+| `GROK_SEARCH_SOURCE_MAX_COMMENTS` | `30` | GitHub / StackExchange comments rendered before folding. |
+| `GROK_SEARCH_ENRICH_CONCURRENCY` | `3` | Parallel source enrichments for `web_search` `include_content` (clamped 1..5). |
+| `GROK_SEARCH_ENRICH_MAX_CHARS` | `15000` | Char cap per enriched source body. |
+
+These specialists need **no Tavily/Firecrawl key** — they hit the public GitHub,
+StackExchange, arXiv, and Wikipedia APIs directly. Tavily/Firecrawl are only used
+for the generic fallback path.
+
+### Selection rules at startup
+
+1. If `GROK_SEARCH_AUTH_MODE=oauth` → **Responses** transport with the local OAuth token.
+2. Else if `GROK_SEARCH_API_KEY` is set → **Responses** transport with a static Bearer key.
+3. Else if both `OPENAI_COMPATIBLE_API_URL` and `OPENAI_COMPATIBLE_API_KEY` are set → **ChatCompletions** transport.
+4. Else → server fails with a clear `MissingConfig` error.
+
+### Global config file
+
+Tired of duplicating `env` blocks across clients? Run `nova-veil-search --init` once to scaffold `<home>/.config/nova-veil-search/config.toml`, fill in your keys, and every client can shrink to `{"command": "nova-veil-search"}`.
+
+| Path order | Location |
+|---|---|
+| 1 | `$GROK_SEARCH_CONFIG` (explicit override, any platform) |
+| 2 | `$HOME/.config/nova-veil-search/config.toml` (Unix / macOS / Git Bash) |
+| 3 | `%USERPROFILE%\.config\nova-veil-search\config.toml` (native Windows) |
+
+**Precedence**: per‑client `env` **>** config file **>** built‑in defaults. File keys are lowercase `snake_case` (env `GROK_SEARCH_MODEL` → file `grok_model`). Unknown keys are rejected. Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+---
+
+## MCP Tools
+
+| Tool | When to call it |
+|---|---|
+| `web_search` | Sourced summary for a topic. Sources cached for follow‑up. `response_format: "concise"` returns answer + metadata only; `"detailed"` inlines source text within the response budget. |
+| `get_sources` | Re‑fetch sources of a previous `web_search` by `session_id`. Supports `offset` / `limit` pagination for large source sets. |
+| `web_fetch` | Page content as clean Markdown. Key‑free specialist extractors for GitHub / StackExchange / arXiv / Wikipedia; every other URL goes through the source chain, which needs at least one provider key. Returns `source_type` + `fallback_reason`. |
+| `web_map` | Discover URLs on a domain via Tavily Map. |
+| `doctor` | Live connectivity probe + redacted config, plus the config file's path and whether it was `absent` / `loaded` / `rejected`. Run first when something looks off. |
+
+---
+
+## Self-hosting (remote HTTP)
+
+Besides the default stdio mode, `nova-veil-search` can run as a **remote, multi‑tenant
+Streamable HTTP MCP server** so mobile / on‑the‑go / multi‑device clients can reach it over
+the network. It is **opt‑in behind the `http` Cargo feature** — the default build is
+unchanged (pure stdio, no HTTP dependencies linked in).
+
+**One shared token, server-held keys (server-config mode).** Set `GROK_MCP_API_TOKEN` to a
+long random string and put the provider keys in the **server's** own environment (compose
+file, `.env`, systemd unit). Every request must then authenticate with a single
+`Authorization: Bearer <token>` header, and authenticated requests run on the server's keys —
+clients carry no keys of their own:
+
+```bash
+claude mcp add --transport http nova-veil-search https://<your-host>/nova-veil-search/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+A caller-supplied `X-*-Api-Key` header still overrides the server key for that request, so a
+trusted power user can opt out of the shared pool. Leave `GROK_MCP_API_TOKEN` unset to stay in
+the mode below.
+
+**Bring‑your‑own‑key, zero shared credentials (default).** The server stores no API keys. Each
+request carries the caller's own keys as headers, so many users can share one endpoint and
+each pays with their own keys:
+
+- `X-Grok-Api-Key`, `X-Tavily-Api-Key`, `X-Firecrawl-Api-Key` (optional `X-GitHub-Token`)
+- Optional non‑secret overrides: `X-Grok-Base-Url` (gateway), `X-Grok-Model` (model name, since model ids are gateway‑specific)
+
+In this mode, setting `TAVILY_API_KEY` / `FIRECRAWL_API_KEY` in the **server's** own
+environment has no effect — those are stripped from every per‑request config, so requests that
+don't carry the header run with no source fallback at all. The server logs a warning at
+startup for each such variable it finds.
+
+A missing required key returns `401` (fail‑closed); OAuth is rejected on this transport
+(stdio only). The operator sets the default Grok‑compatible gateway via `GROK_SEARCH_URL`
+(default `https://api.x.ai`), and callers may point at any other Grok‑compatible gateway with an
+`X-Grok-Base-Url` header (any public gateway is honored; internal/private addresses are rejected).
+The remote transport uses the Grok **Responses** API only; the OpenAI-compatible chat-completions transport is stdio-only.
+
+**No local build needed.** Every release ships ready‑to‑run server artifacts for Linux
+`x86_64` + `aarch64` (static musl) — ideal for low‑RAM/small‑disk boards where a native
+`cargo build` would OOM or fill the disk:
+
+- **Prebuilt binary** — download `nova-veil-search-http_Linux_<arch>.tar.gz` from the
+  [latest release](https://github.com/kingsunb/NovaVeilSearch/releases/latest) and run
+  `GROK_MCP_BIND=0.0.0.0:8080 ./nova-veil-search --http`. (The plain `nova-veil-search_…`
+  assets are **stdio‑only**: the HTTP transport is compile‑time gated and not in them.)
+- **Docker image** — multi‑arch `amd64`/`arm64`:
+  `docker pull ghcr.io/kingsunb/nova-veil-search:latest` (serves on `:8080`).
+
+Building from source instead:
+
+```bash
+cargo build --profile release-http --features http    # release-http => panic=unwind (handler panic won't kill the server)
+GROK_MCP_BIND=127.0.0.1:8080 target/release-http/nova-veil-search --http   # bind loopback; terminate TLS upstream
+```
+
+Put a TLS‑terminating reverse proxy (e.g. Caddy) in front. The repo ships a `Dockerfile`,
+`Dockerfile.deploy` (runtime‑only, multi‑arch `amd64`/`arm64` — cross‑compile the binaries
+first with `scripts/build-deploy-dist.sh`; ideal for low‑RAM hosts), `docker-compose.yml`, and `Caddyfile`
+for a one‑command deploy with automatic HTTPS. Set `MCP_HOSTNAME` (your domain or a
+`<dashed-ip>.sslip.io` name) via the environment or a git‑ignored `.env` — **not** in the
+repo.
+
+Connect a client over Streamable HTTP with the `Authorization: Bearer <token>` header (server-config
+mode, [Quick Start](#quick-start) shows the stdio setup; the header example is [above](#self-hosting-remote-http)),
+pointing `url` at your own host (`https://<your-host>/nova-veil-search/mcp`).
+
+### Rotating a key
+
+Rotation depends on the mode:
+
+- **server-config mode** — keys live on the server, so rotate there (update the provider key
+  in the server environment). Rotate `GROK_MCP_API_TOKEN` itself whenever it has leaked; every
+  client then updates only its `Authorization` header.
+- **bring-your-own-key mode** — keys live on the client. For stdio, update the key in your MCP
+  client's `env` block (or the global `config.toml`) and restart the client. For remote HTTP,
+  update the header value in your client config. For Claude Code:
+  ```bash
+  claude mcp remove nova-veil-search -s user
+  claude mcp add --transport http nova-veil-search https://<your-host>/nova-veil-search/mcp \
+    --header "X-Grok-Api-Key: <new-key>" --header "X-Tavily-Api-Key: <new-key>"
+  ```
+
+Rotate immediately if a key was ever printed, logged, or shared.
+
+---
+
+## Build from source
+
+```bash
+git clone https://github.com/kingsunb/NovaVeilSearch.git
+cd NovaVeilSearch
+cargo build --release
+```
+
+The binary lands at `target/release/nova-veil-search`. Point your MCP client's `command` at the absolute path.
+
+---
+
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+More docs:
+
+- [Configuration](docs/CONFIGURATION.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Testing](docs/TESTING.md)
+
+---
+
+## ⭐ Star History
+
+<a href="https://www.star-history.com/?repos=kingsunb%2FNovaVeilSearch&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kingsunb/NovaVeilSearch&type=date&theme=dark&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kingsunb/NovaVeilSearch&type=date&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kingsunb/NovaVeilSearch&type=date&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
+ </picture>
+</a>
+
+---
+
+## Acknowledgements
+
+- Special thanks to the upstream project [Episkey-G/GrokSearch-rs](https://github.com/Episkey-G/GrokSearch-rs) — this project
+  `NovaVeilSearch` is forked from and renamed after it. Its clean, well-tested Rust MCP architecture and its MIT license made
+  this fork possible; we are grateful to the original author(s) for their work.
+- Inspired by [GuDaStudio/GrokSearch](https://github.com/GuDaStudio/GrokSearch) — the original Python implementation that pioneered the Grok + Tavily + Firecrawl combo this project rewrites in Rust.
+- Thanks to the [LinuxDo](https://linux.do) community for the discussions, feedback, and the prior art that inspired this rewrite.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

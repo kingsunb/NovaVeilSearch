@@ -1,0 +1,19 @@
+# Runtime-only image: copies a pre-built static musl binary (no in-container
+# compile), so it builds instantly even on a 1 GB box. Cross-compile the
+# binaries first on a capable machine (any host OS/arch):
+#   scripts/build-deploy-dist.sh   # -> dist/linux/{amd64,arm64}/nova-veil-search
+# Build for the host platform:
+#   docker build -f Dockerfile.deploy -t nova-veil-search:deploy .
+# Or emit a multi-platform manifest (push to a registry, or containerd store):
+#   docker buildx build -f Dockerfile.deploy \
+#     --platform linux/amd64,linux/arm64 -t <registry>/nova-veil-search:deploy --push .
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates \
+    && adduser -D -H -s /sbin/nologin grokmcp
+# BuildKit sets TARGETPLATFORM per output platform (linux/amd64, linux/arm64, ...).
+ARG TARGETPLATFORM
+COPY dist/${TARGETPLATFORM}/nova-veil-search /usr/local/bin/nova-veil-search
+ENV GROK_MCP_BIND=0.0.0.0:8080
+EXPOSE 8080
+USER grokmcp
+ENTRYPOINT ["nova-veil-search", "--http"]
