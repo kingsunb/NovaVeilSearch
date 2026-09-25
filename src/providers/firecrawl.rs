@@ -1,6 +1,6 @@
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::source::{FetchedPage, Source};
-use crate::providers::http::{build_client, post_json};
+use crate::providers::http::{build_client, post_json_optional_auth};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -10,6 +10,9 @@ pub struct FirecrawlProvider {
     client: Client,
     api_url: String,
     api_key: String,
+    /// Keyless anonymous mode: send no `Authorization` header (Firecrawl's
+    /// hosted `/v2` search/scrape works anonymously, rate-limited).
+    keyless: bool,
 }
 
 impl FirecrawlProvider {
@@ -24,10 +27,22 @@ impl FirecrawlProvider {
         api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_client_mode(client, api_url, api_key, false)
+    }
+
+    /// [`with_client`] plus a keyless flag. Keyless + empty key = no auth
+    /// header at all.
+    pub fn with_client_mode(
+        client: Client,
+        api_url: impl Into<String>,
+        api_key: impl Into<String>,
+        keyless: bool,
+    ) -> Self {
         Self {
             client,
             api_url: api_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
+            keyless,
         }
     }
 
@@ -47,7 +62,12 @@ impl FirecrawlProvider {
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
-        post_json(&self.client, &endpoint, &self.api_key, body, "Firecrawl").await
+        let key = if self.keyless && self.api_key.is_empty() {
+            None
+        } else {
+            Some(self.api_key.as_str())
+        };
+        post_json_optional_auth(&self.client, &endpoint, key, body, "Firecrawl").await
     }
 }
 

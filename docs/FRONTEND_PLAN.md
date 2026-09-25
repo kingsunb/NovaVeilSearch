@@ -16,7 +16,7 @@ All facts below were verified against the current tree (`src/http.rs`,
 |---|----------|-----------|
 | D1 | Serve one **embedded SPA** at `GET /` via `include_str!("../web/index.html")`. Login is **inline in the SPA** — no separate `GET /login` route. | Single asset, no `tower-http`, no build step. A separate `GET /login` page adds a second static asset and a redirect/flow for zero benefit; the SPA already toggles login/settings from one file using `sessionStorage`. |
 | D2 | Config is written with **`toml_edit`** (new dependency), not `toml::Table`, so comments, key order, and every key we don't edit survive. | `config.toml` is a hand-edited, comment-heavy file (`--init` emits an all-comment template). `toml::Table` re-serialization would strip comments and reorder keys. `toml_edit`'s `DocumentMut` preserves both. |
-| D3 | Editable scope is exactly the **4 search sources** (`tavily`, `exa`, `tinyfish`, `firecrawl`) — each `enabled` flag + `api_key` — plus the `source_providers` chain order. Grok/OAuth/OpenAI-compatible/GitHub keys are **out of scope** and remain env/file managed. | Matches the goal ("search sources") and the allowed-name set `{tavily,exa,tinyfish,firecrawl}` already enforced by `service::validate_source_providers`. |
+| D3 | Editable scope is exactly the **4 search sources** (`tavily`, `exa`, `tinyfish`, `firecrawl`) — each `enabled` flag + `api_key` — plus the `source_providers` chain order. Grok/OAuth/OpenAI-compatible/GitHub keys are **out of scope** and remain env/file managed. | Matches the goal ("search sources") and the editor's 4-source allowed-name set (`config::ALLOWED_SOURCE_NAMES`); the chain editor may still name the keyless engines (`duckduckgo`, `bing`), which `validate_source_providers` accepts but which have no key toggles. |
 | D4 | Every `/api/*` endpoint reuses the existing `authorize(&headers, &state)` (master token OR login session token). `GET /` (HTML) is unauthenticated. | Reuse, no new crypto. The HTML contains no secrets. |
 | D5 | Secrets are **never returned**. Key values are reported only as `"set"` / `"unset"`. | Absolute requirement; the existing `redact()`/masking discipline is extended to the API. |
 | D6 | `PUT /api/config` is a **partial merge** with explicit sentinels: omitted/`null` = unchanged, `""` = clear a key, non-empty string = set. | Matches the task's "merge+atomic-write" and lets the SPA send only changed fields (or all fields with nulls). |
@@ -184,7 +184,7 @@ Field semantics (exact):
 ```json
 {
   "errors": [
-    { "field": "source_providers", "message": "unknown source provider \"bing\" (valid: tavily, exa, tinyfish, firecrawl)" }
+    { "field": "source_providers", "message": "unknown source provider \"searxng\" (valid: tavily, exa, tinyfish, duckduckgo, bing, firecrawl)" }
   ]
 }
 ```

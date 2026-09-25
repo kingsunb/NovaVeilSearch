@@ -47,6 +47,13 @@ impl KeyRing {
         self.keys.len()
     }
 
+    /// Whether at least one non-empty key is present. `parse("")` still yields
+    /// a single empty key (preserving the legacy "one bogus key fails upstream"
+    /// path), so `len()` cannot distinguish "no key" from "an empty key".
+    pub(crate) fn has_any_key(&self) -> bool {
+        self.keys.iter().any(|key| !key.is_empty())
+    }
+
     /// Index the next request should start from. `Relaxed` is enough: the
     /// cursor only needs even distribution, not cross-request ordering.
     pub(crate) fn start(&self) -> usize {

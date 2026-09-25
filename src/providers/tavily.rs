@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::model::search::SearchFilters;
 use crate::model::source::{FetchedPage, Source};
-use crate::providers::http::{build_client, post_json_with_status};
+use crate::providers::http::{build_client, post_json_with_header_auth, post_json_with_status};
 use crate::providers::keyring::{is_key_scoped_status, KeyRing};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -15,6 +15,9 @@ pub struct TavilyProvider {
     client: Client,
     api_url: String,
     keys: Arc<KeyRing>,
+    /// Keyless anonymous mode (`x-tavily-access-mode: keyless`), used when no
+    /// API key is configured. Anonymous access is rate-limited.
+    keyless: bool,
 }
 
 impl TavilyProvider {
@@ -33,10 +36,23 @@ impl TavilyProvider {
         api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_client_mode(client, api_url, api_key, false)
+    }
+
+    /// [`with_client`] plus a keyless flag. When `keyless` is set and no key is
+    /// present, requests are sent anonymously via the `x-tavily-access-mode:
+    /// keyless` header instead of a bearer token.
+    pub fn with_client_mode(
+        client: Client,
+        api_url: impl Into<String>,
+        api_key: impl Into<String>,
+        keyless: bool,
+    ) -> Self {
         Self {
             client,
             api_url: api_url.into().trim_end_matches('/').to_string(),
             keys: Arc::new(KeyRing::parse(&api_key.into())),
+            keyless,
         }
     }
 
@@ -77,6 +93,16 @@ impl TavilyProvider {
     /// any other failure — timeout, 5xx, parse — returns immediately.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
+        if self.keyless && !self.keys.has_any_key() {
+            return post_json_with_header_auth(
+                &self.client,
+                &endpoint,
+                ("x-tavily-access-mode", "keyless"),
+                body,
+                "Tavily",
+            )
+            .await;
+        }
         let attempts = self.keys.len();
         let start = self.keys.start();
         let mut last_error = None;

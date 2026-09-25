@@ -1,3 +1,5 @@
+pub mod bing;
+pub mod duckduckgo;
 pub mod exa;
 pub mod firecrawl;
 pub mod grok;

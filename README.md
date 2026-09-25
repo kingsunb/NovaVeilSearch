@@ -2,7 +2,7 @@
 
 ![NovaVeilSearch product banner](assets/nova-veil-search-banner.png)
 
-**A lightweight Rust MCP server for Grok / OpenAI‑compatible web search, backed by an ordered source chain — Tavily, Exa, TinyFish, Firecrawl — for supplemental sources, fetch, and map.**
+**A lightweight Rust MCP server for Grok / OpenAI‑compatible web search, backed by an ordered source chain — Tavily, Exa, TinyFish, DuckDuckGo, Bing, Firecrawl (plus keyless modes for Tavily/Firecrawl/Exa) — for supplemental sources, fetch, and map.**
 
 `nova-veil-search` is an **MCP server** — run it locally over **stdio** (your client launches it; you do not run it directly) or as a **remote Streamable HTTP** service for mobile / multi‑device access (see [self-hosting](#self-hosting-remote-http)). It exposes one set of tools (`web_search`, `get_sources`, `web_fetch`, `web_map`, `doctor`) and supports two upstream transports so you can plug into either xAI's official API or any OpenAI‑compatible relay.
 
@@ -12,11 +12,11 @@
 
 - 🔎 **Live web search** with cited sources, cached for follow‑up `get_sources` calls. Opt‑in `include_content` enriches the top sources with full extracted text in one call.
 - 📏 **Response budgeting** — `web_search` keeps responses inside agent context limits: only the top `max_inline_sources` carry inline text, a whole‑response char budget (`response_max_chars`, default 45k — sized to stay under the MCP client token ceiling after JSON serialization) trims tail sources with recovery notes, `response_format: "concise" | "detailed"` picks the payload size, and `get_sources` pages through cached sources with `offset`/`limit`. The session cache always keeps full content.
-- 🧩 **Structured `web_fetch`** — GitHub issues/PRs/releases, StackExchange/MathOverflow, arXiv, and Wikipedia URLs are parsed by specialist extractors into clean Markdown (title, state/labels, release notes, accepted‑answer ordering, abstracts, vote‑sorted answers). **Specialist extractors need no API key.** Anything else falls back to the generic source chain (Tavily → Exa → TinyFish → Firecrawl, as configured) — so with **no source provider configured, ordinary URLs cannot be fetched at all**, only the specialist families above. Output carries `source_type` and a `fallback_reason` when a specialist was skipped.
+- 🧩 **Structured `web_fetch`** — GitHub issues/PRs/releases, StackExchange/MathOverflow, arXiv, and Wikipedia URLs are parsed by specialist extractors into clean Markdown (title, state/labels, release notes, accepted‑answer ordering, abstracts, vote‑sorted answers). **Specialist extractors need no API key.** Anything else falls back to the generic source chain (Tavily → Exa → TinyFish → Firecrawl, as configured) — so with **no fetch-capable provider configured, ordinary URLs cannot be fetched at all**, only the specialist families above. Output carries `source_type` and a `fallback_reason` when a specialist was skipped.
 - 🔀 **Two transports** — native xAI Responses (`/v1/responses`) **or** any OpenAI‑compatible chat‑completions gateway (`/v1/chat/completions`). Pick by env vars; no flag.
 - 🔐 **Optional Grok OAuth mode** — `login/status/logout` commands store a local xAI OAuth token for Responses auth, so the MCP server can run without `GROK_SEARCH_API_KEY`.
 - 🌐 **Optional remote mode** — build with `--features http` to serve the same tools over **Streamable HTTP** (server-held keys, bearer-token auth + optional `/login` session tokens) for mobile / multi‑device access. See [self-hosting](#self-hosting-remote-http).
-- 📥 **Pluggable source chain** — supplemental sources and generic fetch walk an ordered provider chain: **Tavily** (RAG‑tuned search + extract + map), **Exa** (semantic search, native domain/date filters), **TinyFish** (free search + JS‑rendering fetch), **Firecrawl** (robust scrape fallback). First provider with results wins; `GROK_SEARCH_SOURCE_PROVIDERS` reorders. `TAVILY_API_KEY` accepts a comma‑separated key list — keys rotate round‑robin with automatic failover on rate/quota errors.
+- 📥 **Pluggable source chain** — supplemental sources and generic fetch walk an ordered provider chain: **Tavily** (RAG‑tuned search + extract + map), **Exa** (semantic search, native domain/date filters), **TinyFish** (free search + JS‑rendering fetch), **DuckDuckGo** & **Bing** (keyless scrapers, on by default), **Firecrawl** (robust scrape fallback). First provider with results wins; `GROK_SEARCH_SOURCE_PROVIDERS` reorders. `TAVILY_API_KEY` accepts a comma‑separated key list — keys rotate round‑robin with automatic failover on rate/quota errors. **Keyless modes** (`TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS`) instantiate the paid providers without a key on their free anonymous tiers, and a query‑result cache (`GROK_SEARCH_RESULT_CACHE_*`) deduplicates repeat searches against rate‑limited keyless engines.
 - 🐦 **Optional X/Twitter search** via `x_search` (Responses transport only).
 - 🚦 **Concurrent stdio requests** — up to 8 tool calls are handled at once; anything beyond that queues rather than being refused. Responses come back in completion order, paired to requests by JSON‑RPC `id`.
 - 🩺 **`doctor`** — connectivity probe + redacted config in one tool call, including whether your config file was found, loaded, or rejected (and why).
@@ -106,9 +106,11 @@ The MCP **transport** decides how config reaches the server — same values, dif
 | Firecrawl API key | `FIRECRAWL_API_KEY` |
 | TinyFish API key | `TINYFISH_API_KEY` |
 | Exa API key | `EXA_API_KEY` |
+| Tavily / Firecrawl / Exa anonymous mode | `TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS` |
+| DuckDuckGo / Bing enable & flavor | `DUCKDUCKGO_ENABLED`, `DUCKDUCKGO_REGION`, `BING_ENABLED`, `BING_MARKET` |
 | GitHub token | `GITHUB_TOKEN` |
 
-The tables below use env-key names (they also drive `config.toml` / stdio). Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports.
+The tables below use env-key names (they also drive `config.toml` / stdio). Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports; the keyless engines (DuckDuckGo / Bing) need no key at all.
 
 ### A. Native Grok Responses (default)
 
@@ -174,8 +176,17 @@ Notes:
 | `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Firecrawl base; defaults to `/v2`, preserving explicit `/v1` or `/v2` and gateway prefixes. |
 | `TINYFISH_API_KEY` | unset | Enables TinyFish (free search + JS‑rendering fetch) in the chain. |
 | `EXA_API_KEY` | unset | Enables Exa (semantic search, native filters) in the chain. |
-| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Explicit chain order, e.g. `tinyfish,tavily,firecrawl`. Unset = canonical order `tavily, exa, tinyfish, firecrawl` over configured providers. |
+| `DUCKDUCKGO_ENABLED` | `true` | Keyless DuckDuckGo search (HTML endpoint, Lite fallback); search-only, honors domain/recency filters. |
+| `DUCKDUCKGO_REGION` | unset | Optional DuckDuckGo `kl` region/ad unit (e.g. `us-en`, `cn-zh`). |
+| `BING_ENABLED` | `true` | Keyless Bing search; search-only, honors domain/recency filters, with a relevance guard against zero-result SERPs. |
+| `BING_MARKET` | `en-US` | Optional Bing `mkt` market override (e.g. `zh-CN`). |
+| `TAVILY_KEYLESS` | `false` | Run Tavily anonymously with no key (`x-tavily-access-mode: keyless`). |
+| `FIRECRAWL_KEYLESS` | `false` | Run Firecrawl's hosted `/v2` endpoints with no key. |
+| `EXA_KEYLESS` | `false` | Use Exa's public MCP `web_search_exa` (search-only; no `web_fetch` / filters). |
+| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Explicit chain order, e.g. `tinyfish,tavily,firecrawl`. Unset = canonical order `tavily, exa, tinyfish, duckduckgo, bing, firecrawl` over configured providers. |
 | `GROK_SEARCH_CACHE_SIZE` | `256` | Max cached `web_search` sessions. |
+| `GROK_SEARCH_RESULT_CACHE_SIZE` | `50` | Max cached query→sources entries (LRU) deduplicating provider searches. |
+| `GROK_SEARCH_RESULT_CACHE_TTL_SECONDS` | `300` | Per-entry age limit for the query‑result cache; `0` disables it. |
 | `GROK_SEARCH_TIMEOUT_SECONDS` | `60` | HTTP timeout for all upstreams. |
 | `GROK_SEARCH_FETCH_MAX_CHARS` | unset | Default char cap on `web_fetch`. |
 | `GROK_SEARCH_MAX_INLINE_SOURCES` | `5` | Max `web_search` sources carrying inline content; the rest are metadata‑only. |

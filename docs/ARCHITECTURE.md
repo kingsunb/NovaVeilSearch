@@ -22,7 +22,7 @@ MCP client
 - `get_sources` retrieves cached sources by `session_id`.
 - `web_fetch` fetches page content through the source chain in order (Tavily Extract, Exa contents, TinyFish fetch, Firecrawl scrape — whichever are configured; first non-empty page wins).
 - `web_map` discovers URLs through Tavily Map (the only provider with a real site-map endpoint). It is a dedicated capability rather than a chain position: a `GROK_SEARCH_SOURCE_PROVIDERS` list that leaves Tavily out of the supplemental chain still gets map from a configured `TAVILY_API_KEY`.
-- Source providers are not the default answer generators inside `web_search`; they provide enrichment, fallback sources, fetch, and map capability. The chain order is canonical (`tavily, exa, tinyfish, firecrawl`) over configured providers, or exactly `GROK_SEARCH_SOURCE_PROVIDERS` when set.
+- Source providers are not the default answer generators inside `web_search`; they provide enrichment, fallback sources, fetch, and map capability. The chain order is canonical (`tavily, exa, tinyfish, duckduckgo, bing, firecrawl`) over configured providers, or exactly `GROK_SEARCH_SOURCE_PROVIDERS` when set. DuckDuckGo and Bing are keyless and enabled by default; they are search-only and never participate in `web_fetch`/`web_map`.
 - Agents should use `web_search` for concise sourced summaries, call `get_sources` before source-specific claims, citation lists, or follow-up fetches, and call `web_fetch` for exact page evidence, quotes, technical details, or when the summary is insufficient.
 
 ## Provider Layer

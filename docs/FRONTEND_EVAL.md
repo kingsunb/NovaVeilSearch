@@ -213,11 +213,13 @@ Recommended managed set (TOML key ← env key). All are `Option`-typed in
 
 Notes:
 
-- `source_providers` must be restricted to the canonical names
-  `tavily, exa, tinyfish, firecrawl` (`validate_source_providers`,
-  `src/service.rs:311–320`; `CANONICAL_SOURCE_ORDER`, `src/service.rs:212`).
-  Validate server-side on write using the same function rather than trusting the
-  UI.
+- `source_providers` must be restricted to the valid names
+  `tavily, exa, tinyfish, duckduckgo, bing, firecrawl`
+  (`validate_source_providers`, `src/service.rs`; `CANONICAL_SOURCE_ORDER`).
+  The editable key toggles cover only the four key'd sources
+  (`tavily`, `exa`, `tinyfish`, `firecrawl`); the keyless engines
+  (`duckduckgo`, `bing`) have no key to manage. Validate server-side on write
+  using the same function rather than trusting the UI.
 - Endpoint URLs (`grok_api_url`, `*_api_url`) are deliberately excluded from the
   default managed set. They are advanced/self-host-gateway knobs; if added, they
   are *not* secrets but the server currently masks them (`redact_url` → `******`,

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::cache::SourceCache;
+use crate::cache::{QueryResultCache, SourceCache};
 use crate::config::{AuthMode, Config};
 use crate::credentials::{OAuthCredential, StaticApiKeyCredential};
 use crate::error::{NovaVeilSearchError, Result};
@@ -13,6 +13,8 @@ use crate::model::search::{
 };
 use crate::model::source::{is_junk_title, merge_sources, FetchedPage, Source};
 use crate::model::tool::{GetSourcesOutput, WebFetchOutput, WebSearchInput, WebSearchOutput};
+use crate::providers::bing::BingProvider;
+use crate::providers::duckduckgo::DuckduckgoProvider;
 use crate::providers::exa::ExaProvider;
 use crate::providers::firecrawl::FirecrawlProvider;
 use crate::providers::grok::GrokResponsesProvider;
@@ -137,6 +139,54 @@ impl SourceProvider for ExaProvider {
     }
 }
 
+#[async_trait]
+impl SourceProvider for DuckduckgoProvider {
+    async fn search_sources(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<Source>> {
+        self.search(query, max_results, filters).await
+    }
+
+    async fn fetch(&self, _url: &str) -> Result<FetchedPage> {
+        Err(NovaVeilSearchError::Provider(
+            "DuckDuckGo provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+
+    async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
+        Err(NovaVeilSearchError::Provider(
+            "DuckDuckGo provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl SourceProvider for BingProvider {
+    async fn search_sources(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<Source>> {
+        self.search(query, max_results, filters).await
+    }
+
+    async fn fetch(&self, _url: &str) -> Result<FetchedPage> {
+        Err(NovaVeilSearchError::Provider(
+            "Bing provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+
+    async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
+        Err(NovaVeilSearchError::Provider(
+            "Bing provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+}
+
 /// Static description of one known source provider: how it is configured, how
 /// its absence is reported, and which request shapes it can honor. The
 /// service's source chain (`SourceSlot` list) is built from these at
@@ -153,6 +203,11 @@ pub(crate) struct ProviderSpec {
     supports_filters: bool,
     /// Whether the provider exposes a real site-map endpoint (`web_map`).
     supports_map: bool,
+    /// Whether the provider's `fetch` is usable by the shared page-fetch
+    /// pipeline (`web_fetch` / source enrichment). Search-only scraped engines
+    /// (DuckDuckGo, Bing) are excluded so a fetch never routes arbitrary URLs
+    /// through them.
+    supports_fetch: bool,
     /// Core providers appear in zero-source diagnostics even when
     /// unconfigured; optional ones are mentioned only when the operator names
     /// them in `GROK_SEARCH_SOURCE_PROVIDERS`. Keeps "I never set up Exa"
@@ -168,6 +223,7 @@ const TAVILY_SPEC: ProviderSpec = ProviderSpec {
     header: "x-tavily-api-key",
     supports_filters: true,
     supports_map: true,
+    supports_fetch: true,
     core: true,
 };
 
@@ -179,6 +235,7 @@ const EXA_SPEC: ProviderSpec = ProviderSpec {
     header: "x-exa-api-key",
     supports_filters: true,
     supports_map: false,
+    supports_fetch: true,
     core: false,
 };
 
@@ -190,6 +247,7 @@ const TINYFISH_SPEC: ProviderSpec = ProviderSpec {
     header: "x-tinyfish-api-key",
     supports_filters: true,
     supports_map: false,
+    supports_fetch: true,
     core: false,
 };
 
@@ -201,16 +259,48 @@ const FIRECRAWL_SPEC: ProviderSpec = ProviderSpec {
     header: "x-firecrawl-api-key",
     supports_filters: false,
     supports_map: false,
+    supports_fetch: true,
     core: true,
+};
+
+const DUCKDUCKGO_SPEC: ProviderSpec = ProviderSpec {
+    name: "duckduckgo",
+    display: "DuckDuckGo",
+    enable_var: "DUCKDUCKGO_ENABLED",
+    key_var: "",
+    header: "",
+    supports_filters: true,
+    supports_map: false,
+    supports_fetch: false,
+    core: false,
+};
+
+const BING_SPEC: ProviderSpec = ProviderSpec {
+    name: "bing",
+    display: "Bing",
+    enable_var: "BING_ENABLED",
+    key_var: "",
+    header: "",
+    supports_filters: true,
+    supports_map: false,
+    supports_fetch: false,
+    core: false,
 };
 
 /// Canonical chain order. Tavily's RAG-tuned results keep the primary slot;
 /// Exa (semantic search, native filter support) outranks the keyword engines
-/// among the newcomers; TinyFish is the free keyword/fetch tier; Firecrawl
-/// keeps its historical last-resort slot because its search cannot honor
-/// filters. `GROK_SEARCH_SOURCE_PROVIDERS` overrides this order entirely.
-const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 4] =
-    [&TAVILY_SPEC, &EXA_SPEC, &TINYFISH_SPEC, &FIRECRAWL_SPEC];
+/// among the newcomers; TinyFish is the free keyword/fetch tier; DuckDuckGo and
+/// Bing are keyless free engines that can answer without any credentials;
+/// Firecrawl keeps its historical last-resort slot because its search cannot
+/// honor filters. `GROK_SEARCH_SOURCE_PROVIDERS` overrides this order entirely.
+const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 6] = [
+    &TAVILY_SPEC,
+    &EXA_SPEC,
+    &TINYFISH_SPEC,
+    &DUCKDUCKGO_SPEC,
+    &BING_SPEC,
+    &FIRECRAWL_SPEC,
+];
 
 /// One instantiated provider in the source chain.
 #[derive(Clone)]
@@ -237,28 +327,36 @@ fn instantiate_source(
     http: &reqwest::Client,
 ) -> Option<Arc<dyn SourceProvider>> {
     match spec.name {
-        "tavily" => config
-            .tavily_enabled
-            .then(|| config.tavily_api_key.clone())
-            .flatten()
-            .map(|key| {
-                Arc::new(TavilyProvider::with_client(
-                    http.clone(),
-                    config.tavily_api_url.clone(),
-                    key,
-                )) as Arc<dyn SourceProvider>
-            }),
-        "exa" => config
-            .exa_enabled
-            .then(|| config.exa_api_key.clone())
-            .flatten()
-            .map(|key| {
-                Arc::new(ExaProvider::with_client(
-                    http.clone(),
-                    config.exa_api_url.clone(),
-                    key,
-                )) as Arc<dyn SourceProvider>
-            }),
+        "tavily" => {
+            if !config.tavily_enabled {
+                return None;
+            }
+            let key = config.tavily_api_key.clone().unwrap_or_default();
+            if key.is_empty() && !config.tavily_keyless {
+                return None;
+            }
+            Some(Arc::new(TavilyProvider::with_client_mode(
+                http.clone(),
+                config.tavily_api_url.clone(),
+                key,
+                config.tavily_keyless,
+            )) as Arc<dyn SourceProvider>)
+        }
+        "exa" => {
+            if !config.exa_enabled {
+                return None;
+            }
+            let key = config.exa_api_key.clone().unwrap_or_default();
+            if key.is_empty() && !config.exa_keyless {
+                return None;
+            }
+            Some(Arc::new(ExaProvider::with_client_mode(
+                http.clone(),
+                config.exa_api_url.clone(),
+                key,
+                config.exa_keyless,
+            )) as Arc<dyn SourceProvider>)
+        }
         "tinyfish" => config
             .tinyfish_enabled
             .then(|| config.tinyfish_api_key.clone())
@@ -271,17 +369,33 @@ fn instantiate_source(
                     key,
                 )) as Arc<dyn SourceProvider>
             }),
-        "firecrawl" => config
-            .firecrawl_enabled
-            .then(|| config.firecrawl_api_key.clone())
-            .flatten()
-            .map(|key| {
-                Arc::new(FirecrawlProvider::with_client(
-                    http.clone(),
-                    config.firecrawl_api_url.clone(),
-                    key,
-                )) as Arc<dyn SourceProvider>
-            }),
+        "firecrawl" => {
+            if !config.firecrawl_enabled {
+                return None;
+            }
+            let key = config.firecrawl_api_key.clone().unwrap_or_default();
+            if key.is_empty() && !config.firecrawl_keyless {
+                return None;
+            }
+            Some(Arc::new(FirecrawlProvider::with_client_mode(
+                http.clone(),
+                config.firecrawl_api_url.clone(),
+                key,
+                config.firecrawl_keyless,
+            )) as Arc<dyn SourceProvider>)
+        }
+        "duckduckgo" => config.duckduckgo_enabled.then(|| {
+            Arc::new(DuckduckgoProvider::with_client(
+                http.clone(),
+                config.duckduckgo_region.clone(),
+            )) as Arc<dyn SourceProvider>
+        }),
+        "bing" => config.bing_enabled.then(|| {
+            Arc::new(BingProvider::with_client(
+                http.clone(),
+                config.bing_market.clone(),
+            )) as Arc<dyn SourceProvider>
+        }),
         _ => None,
     }
 }
@@ -292,6 +406,8 @@ fn provider_enabled(spec: &ProviderSpec, config: &Config) -> bool {
         "exa" => config.exa_enabled,
         "tinyfish" => config.tinyfish_enabled,
         "firecrawl" => config.firecrawl_enabled,
+        "duckduckgo" => config.duckduckgo_enabled,
+        "bing" => config.bing_enabled,
         _ => false,
     }
 }
@@ -312,7 +428,7 @@ pub fn validate_source_providers(config: &Config) -> Result<()> {
     for name in &config.source_providers {
         if !CANONICAL_SOURCE_ORDER.iter().any(|spec| spec.name == name) {
             return Err(NovaVeilSearchError::InvalidParams(format!(
-                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, firecrawl)"
+                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, duckduckgo, bing, firecrawl)"
             )));
         }
     }
@@ -367,6 +483,12 @@ pub struct SearchService {
     /// Behind `Arc` so `SearchService: Clone` stays cheap.
     source_slots: Arc<Vec<SourceSlot>>,
     cache: Arc<Mutex<SourceCache>>,
+    /// Query-result LRU cache for the supplemental source fan-out, keyed by a
+    /// normalized query + filter signature. Bounded in size and per-entry age;
+    /// `result_cache_ttl_seconds == 0` disables it. Behind `Arc` so
+    /// `SearchService: Clone` stays cheap; rebuilt per service so each stdio
+    /// process (and each per-request HTTP service) owns its cache lifetime.
+    query_cache: Arc<Mutex<QueryResultCache>>,
     /// Shared reqwest client for the sources pipeline (same instance handed to
     /// providers). Stored here because resolve_content needs direct GET access.
     http_client: reqwest::Client,
@@ -545,12 +667,17 @@ impl SearchService {
         cache: Arc<Mutex<SourceCache>>,
         providers: ProviderSet,
     ) -> Self {
+        let query_cache = Arc::new(Mutex::new(QueryResultCache::new(
+            config.result_cache_size,
+            std::time::Duration::from_secs(config.result_cache_ttl_seconds),
+        )));
         Self {
             cache,
             default_model: providers.default_model,
             config,
             ai: providers.ai,
             source_slots: Arc::new(providers.source_slots),
+            query_cache,
             http_client: http,
             source_router: providers.source_router,
         }
@@ -564,6 +691,16 @@ impl SearchService {
                 SourceSlot::Active(entry) => Some(entry.clone()),
                 SourceSlot::Missing { .. } => None,
             })
+            .collect()
+    }
+
+    /// Active providers that can actually fetch a page (`supports_fetch`).
+    /// Search-only scraped engines (DuckDuckGo, Bing) are excluded so the
+    /// shared page-fetch pipeline never routes arbitrary URLs through them.
+    fn fetch_sources(&self) -> Vec<SourceEntry> {
+        self.active_sources()
+            .into_iter()
+            .filter(|entry| entry.spec.supports_fetch)
             .collect()
     }
 
@@ -583,6 +720,10 @@ impl SearchService {
         let firecrawl_enabled = config.firecrawl_enabled;
         Self {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             default_model: resolve_default_model(&config),
             config,
             ai: Arc::new(FakeAiProvider),
@@ -661,6 +802,10 @@ impl SearchService {
         let source_slots = Self::fake_slots(primary, fallback, config.firecrawl_enabled);
         Self {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             default_model: resolve_default_model(&config),
             config,
             ai: ai.unwrap_or_else(|| Arc::new(FakeAiProvider)),
@@ -692,6 +837,10 @@ impl SearchService {
         let source_slots = Self::fake_slots(primary, fallback, config.firecrawl_enabled);
         Self {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             default_model: resolve_default_model(&config),
             config,
             ai: Arc::new(FakeAiProvider),
@@ -795,7 +944,7 @@ impl SearchService {
                 self.config.enrich_concurrency,
                 self.config.enrich_max_chars,
                 self.config.max_inline_sources,
-                self.active_sources(),
+                self.fetch_sources(),
             )
             .await
         } else {
@@ -852,6 +1001,10 @@ impl SearchService {
                 "source fan-out disabled (extra_sources and fallback_sources are both 0)",
             )]);
         }
+        let cache_key = self.query_cache_key(query, count, filters);
+        if let Some((cached, origin)) = self.query_cache.lock().await.get(&cache_key) {
+            return RawSources::found(cached, Some(origin));
+        }
         let mut notes = Vec::new();
         for slot in self.source_slots.iter() {
             match slot {
@@ -897,6 +1050,11 @@ impl SearchService {
                                         source_diagnosis(&notes)
                                     );
                                 }
+                                self.query_cache.lock().await.set(
+                                    cache_key.clone(),
+                                    usable.clone(),
+                                    name,
+                                );
                                 return RawSources::found(usable, Some(name));
                             }
                             Err(note) => notes.push(note),
@@ -933,6 +1091,25 @@ impl SearchService {
             }
         }
         RawSources::empty(notes)
+    }
+
+    /// Deterministic cache key for the supplemental fan-out: normalized query
+    /// plus the full filter signature (sorted domain lists and recency). Two
+    /// requests that differ only in case, whitespace, or domain ordering map
+    /// to the same key; any semantic filter difference maps elsewhere.
+    fn query_cache_key(&self, query: &str, count: usize, filters: &SearchFilters) -> String {
+        let mut include = filters.include_domains.clone();
+        include.sort();
+        let mut exclude = filters.exclude_domains.clone();
+        exclude.sort();
+        format!(
+            "q={}\x1finc={}\x1fexc={}\x1fdays={}\x1fn={}",
+            query.trim().to_lowercase(),
+            include.join(","),
+            exclude.join(","),
+            filters.recency_days.unwrap_or(0),
+            count,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1015,7 +1192,7 @@ impl SearchService {
                 self.config.enrich_concurrency,
                 self.config.enrich_max_chars,
                 self.config.max_inline_sources,
-                self.active_sources(),
+                self.fetch_sources(),
             )
             .await
         } else {
@@ -1160,7 +1337,7 @@ impl SearchService {
     /// helper: without this, each chain position would get its own full
     /// client timeout and the chain would multiply the configured budget.
     async fn web_fetch_raw(&self, url: &str, deadline: tokio::time::Instant) -> Result<String> {
-        let chain = self.active_sources();
+        let chain = self.fetch_sources();
         match tokio::time::timeout_at(deadline, generic_source_fetch(&chain, url)).await {
             Ok(result) => result.map(|page| page.content),
             Err(_elapsed) => Err(NovaVeilSearchError::Timeout(format!(
@@ -1200,6 +1377,8 @@ impl SearchService {
         let exa_probe = self.probe_chain_source("exa").await;
         let tinyfish_probe = self.probe_chain_source("tinyfish").await;
         let firecrawl_probe = self.probe_chain_source("firecrawl").await;
+        let duckduckgo_probe = self.probe_chain_source("duckduckgo").await;
+        let bing_probe = self.probe_chain_source("bing").await;
         let source_chain: Vec<&str> = self
             .source_slots
             .iter()
@@ -1280,6 +1459,18 @@ impl SearchService {
                 "reachable": firecrawl_probe.ok,
                 "detail": firecrawl_probe.detail,
             },
+            "duckduckgo": {
+                "enabled": self.config.duckduckgo_enabled,
+                "region": self.config.duckduckgo_region,
+                "reachable": duckduckgo_probe.ok,
+                "detail": duckduckgo_probe.detail,
+            },
+            "bing": {
+                "enabled": self.config.bing_enabled,
+                "market": self.config.bing_market,
+                "reachable": bing_probe.ok,
+                "detail": bing_probe.detail,
+            },
             "source_chain": source_chain,
             // Whether the config file was read at all, and why not when it was
             // not. Without this a rejected file is indistinguishable from an
@@ -1313,12 +1504,18 @@ impl SearchService {
         match active {
             Some(entry) => probe_source(entry.provider.as_ref(), "https://example.com").await,
             None => {
-                let key_var = CANONICAL_SOURCE_ORDER
+                let detail = CANONICAL_SOURCE_ORDER
                     .iter()
                     .find(|spec| spec.name == name)
-                    .map(|spec| spec.key_var)
-                    .unwrap_or("API key");
-                Probe::skipped(format!("{key_var} not configured"))
+                    .map(|spec| {
+                        if spec.key_var.is_empty() {
+                            "disabled or not in source chain".to_string()
+                        } else {
+                            format!("{} not configured", spec.key_var)
+                        }
+                    })
+                    .unwrap_or_else(|| "API key not configured".to_string());
+                Probe::skipped(detail)
             }
         }
     }
@@ -1692,6 +1889,8 @@ mod chain_tests {
                 "active:tavily",
                 "active:exa",
                 "active:tinyfish",
+                "active:duckduckgo",
+                "active:bing",
                 "active:firecrawl"
             ]
         );
@@ -1699,14 +1898,22 @@ mod chain_tests {
 
     // Core providers keep their historical place in zero-source diagnostics
     // even when unconfigured; optional ones stay out unless named explicitly,
-    // so "I never set up Exa" cannot read as a broken credential.
+    // so "I never set up Exa" cannot read as a broken credential. Keyless
+    // engines (DuckDuckGo/Bing) are enabled by default and need no key, so
+    // they slot in even with a zero-key config.
     #[test]
     fn default_chain_slots_missing_core_but_omits_missing_optional() {
         let config = Config::from_env_map([("TINYFISH_API_KEY", "f")]);
         let slots = build_source_slots(&config, &http()).expect("slots");
         assert_eq!(
             slot_names(&slots),
-            ["missing:tavily", "active:tinyfish", "missing:firecrawl"]
+            [
+                "missing:tavily",
+                "active:tinyfish",
+                "active:duckduckgo",
+                "active:bing",
+                "missing:firecrawl"
+            ]
         );
     }
 
@@ -1795,6 +2002,10 @@ mod chain_tests {
             ai,
             source_slots: Arc::new(slots),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         }
@@ -1918,6 +2129,10 @@ mod chain_tests {
                 }),
             ]),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -1981,6 +2196,10 @@ mod chain_tests {
                 }),
             ]),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2018,6 +2237,10 @@ mod chain_tests {
                 provider: Arc::new(NamedSourceProvider("tinyfish")),
             })]),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2185,7 +2408,7 @@ fn apply_fetch_limit(
 /// surfaces, so users are not sent to debug config that is actually set.
 async fn generic_source_fetch(chain: &[SourceEntry], url: &str) -> Result<FetchedPage> {
     let mut last_error: Option<NovaVeilSearchError> = None;
-    for entry in chain {
+    for entry in chain.iter().filter(|entry| entry.spec.supports_fetch) {
         match entry.provider.fetch(url).await {
             Ok(page) if !page.content.trim().is_empty() => return Ok(page),
             Ok(_) => {
@@ -2673,6 +2896,10 @@ mod transport_dispatch_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2699,6 +2926,10 @@ mod transport_dispatch_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2721,6 +2952,10 @@ mod transport_dispatch_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2740,6 +2975,10 @@ mod transport_dispatch_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         };
@@ -2755,6 +2994,10 @@ mod transport_dispatch_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
         }
@@ -3008,6 +3251,10 @@ mod enrich_tests {
             ai: Arc::new(FakeAiProvider),
             source_slots: Arc::new(source_slots),
             cache: Arc::new(Mutex::new(SourceCache::new(64))),
+            query_cache: Arc::new(Mutex::new(QueryResultCache::new(
+                1,
+                std::time::Duration::ZERO,
+            ))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(router),
         }

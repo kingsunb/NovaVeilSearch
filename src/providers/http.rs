@@ -188,6 +188,215 @@ pub async fn get_json_with_header_auth(
     .map_err(|failure| failure.error)
 }
 
+/// Browser-like `User-Agent` used by keyless HTML-scraping providers
+/// (DuckDuckGo, Bing). Free search engines reject or challenge default
+/// CLI-style user agents.
+pub const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+/// Issue an authenticated JSON POST whose bearer key is optional: an empty or
+/// absent key sends no `Authorization` header at all (keyless anonymous mode).
+pub async fn post_json_optional_auth(
+    client: &Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    body: &Value,
+    label: &str,
+) -> Result<Value> {
+    let request = client.post(endpoint).json(body);
+    let request = match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    send_json(request, label)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// Fetch a plain HTML page with browser-like headers and normalize transport /
+/// status failures. `query` becomes the URL query string. Used by the keyless
+/// DuckDuckGo and Bing scrapers, which return ordinary `text/html`.
+pub async fn get_html(
+    client: &Client,
+    endpoint: &str,
+    query: &[(&str, String)],
+    label: &str,
+) -> Result<String> {
+    let response = client
+        .get(endpoint)
+        .query(query)
+        .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
+        .header(
+            reqwest::header::ACCEPT_LANGUAGE,
+            "en-US,en;q=0.9,zh-CN;q=0.8",
+        )
+        .send()
+        .await
+        .map_err(|err| {
+            if err.is_timeout() {
+                NovaVeilSearchError::Timeout(format!("{label} request timed out: {err}"))
+            } else {
+                NovaVeilSearchError::Provider(format!("{label} request failed: {err}"))
+            }
+        })?;
+
+    let status = response.status();
+    let html = response
+        .text()
+        .await
+        .map_err(|err| NovaVeilSearchError::Provider(format!("{label} body read failed: {err}")))?;
+
+    if !status.is_success() {
+        return Err(NovaVeilSearchError::Provider(format!(
+            "{label} returned HTTP {status}: {}",
+            truncate_for_error(&html)
+        )));
+    }
+    if is_anti_bot_challenge(&html) {
+        return Err(NovaVeilSearchError::Provider(format!(
+            "{label} is rate-limited (anti-bot challenge; usually temporary)"
+        )));
+    }
+    Ok(html)
+}
+
+/// POST a JSON-RPC body with arbitrary headers (no auth) and return the raw
+/// response body as text. Used for the Exa MCP endpoint, which answers with an
+/// SSE stream that the caller parses itself.
+pub async fn post_raw_json(
+    client: &Client,
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    body: &Value,
+    label: &str,
+) -> Result<String> {
+    let mut request = client.post(endpoint);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.json(body).send().await.map_err(|err| {
+        if err.is_timeout() {
+            NovaVeilSearchError::Timeout(format!("{label} request timed out: {err}"))
+        } else {
+            NovaVeilSearchError::Provider(format!("{label} request failed: {err}"))
+        }
+    })?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| NovaVeilSearchError::Provider(format!("{label} body read failed: {err}")))?;
+    if !status.is_success() {
+        return Err(NovaVeilSearchError::Provider(format!(
+            "{label} returned HTTP {status}: {}",
+            truncate_for_error(&text)
+        )));
+    }
+    Ok(text)
+}
+
+/// Cap an error-body excerpt so a hostile/inflated upstream can't bloat notes.
+fn truncate_for_error(text: &str) -> String {
+    let excerpt: String = text.chars().take(200).collect();
+    if text.chars().count() > 200 {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+/// Heuristic detector for search-engine anti-bot interstitial pages (CAPTCHA /
+/// anomaly checks) that still return HTTP 200.
+pub(crate) fn is_anti_bot_challenge(html: &str) -> bool {
+    let head = html.get(..8_000).unwrap_or(html).to_ascii_lowercase();
+    [
+        "anomaly detection",
+        "captcha",
+        "unusual traffic",
+        "robot check",
+    ]
+    .iter()
+    .any(|marker| head.contains(marker))
+}
+
+/// Strip every `<...>` tag from an HTML fragment. Non-nesting-safe on purpose:
+/// search-result fields never contain `<` except as tag delimiters.
+pub(crate) fn strip_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        match rest[open..].find('>') {
+            Some(close) => rest = &rest[open + close + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode the HTML entities search engines actually emit (`&amp;`, `&lt;`,
+/// `&gt;`, `&quot;`, `&apos;`, `&nbsp;`, and numeric `&#…;` / `&#x…;`).
+/// Unknown named entities are left untouched.
+pub(crate) fn decode_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        match after.find(';') {
+            Some(end) => {
+                let entity = &after[1..end];
+                let decoded = match entity {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some(' '),
+                    _ => decode_numeric_entity(entity),
+                };
+                match decoded {
+                    Some(ch) => out.push(ch),
+                    None => out.push_str(&after[..=end]), // unknown: keep verbatim
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_numeric_entity(entity: &str) -> Option<char> {
+    let stripped = entity.strip_prefix('#')?;
+    let code = if let Some(hex) = stripped
+        .strip_prefix('x')
+        .or_else(|| stripped.strip_prefix('X'))
+    {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        stripped.parse::<u32>().ok()?
+    };
+    char::from_u32(code)
+}
+
+/// Collapse runs of whitespace into single spaces and trim the ends. Applied to
+/// every scraped title/snippet so inline markup and pretty-printed HTML don't
+/// leak extra blanks into results.
+pub(crate) fn squash_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Send a prepared JSON request and normalize transport / status / parse
 /// failures into `HttpFailure`. Shared by the bearer- and header-auth helpers
 /// so every provider gets identical error handling (including the SSE path).

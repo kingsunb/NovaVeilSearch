@@ -26,6 +26,8 @@ Which channel carries your config is decided by the MCP **transport**, not a pro
 | Firecrawl API key | `FIRECRAWL_API_KEY` |
 | TinyFish API key | `TINYFISH_API_KEY` |
 | Exa API key | `EXA_API_KEY` |
+| Tavily / Firecrawl / Exa anonymous mode | `TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS` |
+| DuckDuckGo / Bing enable & flavor | `DUCKDUCKGO_ENABLED`, `DUCKDUCKGO_REGION`, `BING_ENABLED`, `BING_MARKET` |
 | GitHub token | `GITHUB_TOKEN` |
 
 All entries are **operator-fixed** on the remote transport — set once in the server's own environment, never per request. **Two groups are stdio-only:** OAuth (`GROK_SEARCH_AUTH_MODE` / `GROK_SEARCH_AUTH_FILE`) and the OpenAI-compatible chat-completions transport (`OPENAI_COMPATIBLE_API_URL` / `_API_KEY` / `_MODEL`). The remote server serves Grok **Responses** only; to run a chat-completions relay, use the stdio transport.
@@ -171,23 +173,65 @@ Semantic (embeddings-first) search with native `includeDomains` / `excludeDomain
 | `EXA_API_URL` | `https://api.exa.ai` | Exa API base URL. |
 | `EXA_ENABLED` | `true` | Optional override. Set to `false` to disable Exa even if a key is configured. |
 
-## Source chain
+## DuckDuckGo & Bing (keyless fallback engines)
 
-Supplemental sources and generic (non-specialist) fetch walk an ordered provider chain; the first provider with usable output wins and later ones are pure fallback. Providers that cannot honor domain/recency filters (Firecrawl) are skipped for filtered requests. The whole chain shares one request deadline (`GROK_SEARCH_TIMEOUT_SECONDS`) — a slow provider cannot multiply the budget by the chain length.
-
-`web_map` is a separate capability, not part of this chain: it always uses Tavily whenever `TAVILY_API_KEY` is configured, even when the chain excludes Tavily.
-
-**The chain and the specialist extractors are different things.** A *source provider* (Tavily, Exa, TinyFish, Firecrawl) is an external service gated behind an API key. A *specialist extractor* (GitHub, StackExchange, arXiv, Wikipedia) is a key-free parser for one family of URLs; it is never configured and never part of the chain. So with **no source provider configured at all**, `web_fetch` still handles those four families, and fails on every ordinary URL — there is nothing left that can retrieve one. Inline enrichment in `web_search` behaves the same way and says so by name.
+Two key-free scrapers back the source chain when no paid key is present. Both are
+**enabled by default** and need neither a key nor a signup, so `web_search`
+still surfaces external sources on a zero-key install. They are **search-only**:
+`web_fetch`/`web_map` do not route arbitrary URLs through them (that stays with
+the fetch-capable providers).
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Comma-separated explicit chain order, e.g. `tinyfish,tavily,firecrawl` (valid names: `tavily`, `exa`, `tinyfish`, `firecrawl`). Unset = configured providers in canonical order `tavily, exa, tinyfish, firecrawl`. Unknown names fail at startup. |
+| `DUCKDUCKGO_ENABLED` | `true` | Scrape DuckDuckGo's HTML endpoint (falling back to the Lite endpoint) as a chain provider. |
+| `DUCKDUCKGO_REGION` | unset | Optional `kl` region/ad unit passed to DuckDuckGo (e.g. `us-en`, `cn-zh`, `wt-wt`). |
+| `BING_ENABLED` | `true` | Scrape `www.bing.com/search` as a chain provider. |
+| `BING_MARKET` | `en-US` | Optional Bing `mkt` market override (e.g. `zh-CN`). |
+
+Both honor domain/recency filters by rewriting the query or adding parameters;
+DuckDuckGo supports time filtering via its `df` parameter and Bing via `qft`
+recency intervals. Bing additionally runs a relevance guard that discards
+results whose title+snippet share no meaningful token with the query (this
+defeats the case where Bing returns its cached "no results" SERP and a stale
+page sneaks through).
+
+## Keyless (anonymous) modes for paid providers
+
+Tavily, Firecrawl, and Exa each expose a free keyless tier. Setting the matching
+flag instantiates the provider **even with no key**:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TAVILY_KEYLESS` | `false` | Use Tavily's anonymous mode (`x-tavily-access-mode: keyless` header). Rate-limited and may lack premium sources. |
+| `FIRECRAWL_KEYLESS` | `false` | Call Firecrawl's hosted `/v2` endpoints with no `Authorization` header. |
+| `EXA_KEYLESS` | `false` | Use Exa's hosted public MCP `web_search_exa` tool (search-only; `web_fetch` and domain/recency filters are unavailable in this mode). |
+
+A configured key always wins over the keyless flag: set both and requests use
+the key. Exa's keyless search takes only `query` + `numResults`, so a filtered
+request (`include_domains`, `exclude_domains`, or `recency_days`) is skipped and
+the chain falls through to the next provider.
+
+## Source chain
+
+Supplemental sources and generic (non-specialist) fetch walk an ordered provider chain; the first provider with usable output wins and later ones are pure fallback. Providers that cannot honor domain/recency filters (Firecrawl, and Exa in keyless mode) are skipped for filtered requests. The whole chain shares one request deadline (`GROK_SEARCH_TIMEOUT_SECONDS`) — a slow provider cannot multiply the budget by the chain length.
+
+`web_map` is a separate capability, not part of this chain: it always uses Tavily whenever `TAVILY_API_KEY` is configured, even when the chain excludes Tavily.
+
+**The chain and the specialist extractors are different things.** A *source provider* (Tavily, Exa, TinyFish, DuckDuckGo, Bing, Firecrawl) is an external service — the first four are normally gated behind an API key, the last two are keyless scrapers. A *specialist extractor* (GitHub, StackExchange, arXiv, Wikipedia) is a key-free parser for one family of URLs; it is never configured and never part of the chain. So with **no source provider configured at all**, `web_fetch` still handles those four families, and fails on every ordinary URL — there is nothing left that can retrieve one. Inline enrichment in `web_search` behaves the same way and says so by name.
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Comma-separated explicit chain order, e.g. `tinyfish,tavily,firecrawl` (valid names: `tavily`, `exa`, `tinyfish`, `duckduckgo`, `bing`, `firecrawl`). Unset = configured providers in canonical order `tavily, exa, tinyfish, duckduckgo, bing, firecrawl`. Unknown names fail at startup. |
 
 ## Cache
+
+Bounded session + query-result caching. The session cache (`get_sources`) keeps full content; the query-result cache deduplicates repeat provider searches so keyless engines (which rate-limit) return cached hits instead of exhausting their budget.
 
 | Variable | Default | Description |
 |---|---|---|
 | `GROK_SEARCH_CACHE_SIZE` | `256` | Maximum cached search sessions for `get_sources`. |
+| `GROK_SEARCH_RESULT_CACHE_SIZE` | `50` | Maximum cached query→sources entries (LRU). |
+| `GROK_SEARCH_RESULT_CACHE_TTL_SECONDS` | `300` | Per-entry age limit; `0` disables the query-result cache. The key is the normalized query + sorted include/exclude domains + recency + requested count. |
 | `GROK_SEARCH_TIMEOUT_SECONDS` | `60` | HTTP timeout for Grok, Tavily, and Firecrawl requests. |
 | `GROK_SEARCH_FETCH_MAX_CHARS` | unset | Default character cap on `web_fetch` content. Overridden per call by `max_chars`. Unset means no truncation. |
 
@@ -257,9 +301,11 @@ Unknown keys are rejected by the loader — typos surface as parse errors instea
 | `tavily_api_url` | `TAVILY_API_URL` |
 | `tavily_api_key` | `TAVILY_API_KEY` |
 | `tavily_enabled` | `TAVILY_ENABLED` |
+| `tavily_keyless` | `TAVILY_KEYLESS` |
 | `firecrawl_api_url` | `FIRECRAWL_API_URL` |
 | `firecrawl_api_key` | `FIRECRAWL_API_KEY` |
 | `firecrawl_enabled` | `FIRECRAWL_ENABLED` |
+| `firecrawl_keyless` | `FIRECRAWL_KEYLESS` |
 | `tinyfish_search_api_url` | `TINYFISH_SEARCH_API_URL` |
 | `tinyfish_fetch_api_url` | `TINYFISH_FETCH_API_URL` |
 | `tinyfish_api_key` | `TINYFISH_API_KEY` |
@@ -267,11 +313,18 @@ Unknown keys are rejected by the loader — typos surface as parse errors instea
 | `exa_api_url` | `EXA_API_URL` |
 | `exa_api_key` | `EXA_API_KEY` |
 | `exa_enabled` | `EXA_ENABLED` |
+| `exa_keyless` | `EXA_KEYLESS` |
+| `duckduckgo_enabled` | `DUCKDUCKGO_ENABLED` |
+| `duckduckgo_region` | `DUCKDUCKGO_REGION` |
+| `bing_enabled` | `BING_ENABLED` |
+| `bing_market` | `BING_MARKET` |
 | `source_providers` | `GROK_SEARCH_SOURCE_PROVIDERS` |
 | `default_extra_sources` | `GROK_SEARCH_EXTRA_SOURCES` |
 | `fallback_sources` | `GROK_SEARCH_FALLBACK_SOURCES` |
 | `fetch_max_chars` | `GROK_SEARCH_FETCH_MAX_CHARS` |
 | `cache_size` | `GROK_SEARCH_CACHE_SIZE` |
+| `result_cache_size` | `GROK_SEARCH_RESULT_CACHE_SIZE` |
+| `result_cache_ttl_seconds` | `GROK_SEARCH_RESULT_CACHE_TTL_SECONDS` |
 | `timeout_seconds` | `GROK_SEARCH_TIMEOUT_SECONDS` |
 | `github_token` | `GITHUB_TOKEN` |
 | `source_max_answers` | `GROK_SEARCH_SOURCE_MAX_ANSWERS` |
@@ -312,9 +365,17 @@ tavily_enabled        = true
 firecrawl_api_url     = "https://api.firecrawl.dev"
 firecrawl_api_key     = "fc-..."
 firecrawl_enabled     = true
+# firecrawl_keyless   = false
+# exa_keyless         = false
+# duckduckgo_enabled  = true
+# duckduckgo_region   = "us-en"
+# bing_enabled        = true
+# bing_market         = "en-US"
 default_extra_sources = 3
 fallback_sources      = 5
 fetch_max_chars       = 200000
 cache_size            = 256
+result_cache_size     = 50
+result_cache_ttl_seconds = 300
 timeout_seconds       = 60
 ```

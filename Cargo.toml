@@ -36,6 +36,7 @@ getrandom = "0.3"
 ring = "0.17"
 url = "2"
 percent-encoding = "2"
+regex = "1"
 quick-xml = { version = "0.37", default-features = false, features = ["encoding"] }
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json"] }
 

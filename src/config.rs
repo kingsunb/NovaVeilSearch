@@ -38,6 +38,19 @@ pub struct Config {
     pub exa_api_url: String,
     pub exa_api_key: Option<String>,
     pub exa_enabled: bool,
+    /// Keyless anonymous modes (`x-tavily-access-mode: keyless`). Default off:
+    /// setting them on makes the provider instantiate even without a key.
+    pub tavily_keyless: bool,
+    pub firecrawl_keyless: bool,
+    pub exa_keyless: bool,
+    /// Keyless engines that need no key at all. Enabled by default so a
+    /// zero-key configuration still searches.
+    pub duckduckgo_enabled: bool,
+    /// Optional DDG `kl` region/ad unit (e.g. `us-en`, `cn-zh`, `wt-wt`).
+    pub duckduckgo_region: Option<String>,
+    pub bing_enabled: bool,
+    /// Optional Bing market (`mkt`, e.g. `en-US`, `zh-CN`). Defaults to `en-US`.
+    pub bing_market: Option<String>,
     /// Explicit source-provider chain order (lowercased names). Empty means
     /// "use the built-in canonical order over whatever is configured".
     pub source_providers: Vec<String>,
@@ -45,6 +58,10 @@ pub struct Config {
     pub fallback_sources: usize,
     pub fetch_max_chars: Option<usize>,
     pub cache_size: usize,
+    /// Query-result LRU cache for the supplemental source fan-out. `0`
+    /// disables it; `result_cache_ttl_seconds` bounds per-entry staleness.
+    pub result_cache_size: usize,
+    pub result_cache_ttl_seconds: u64,
     pub timeout: Duration,
     pub openai_compatible_api_url: Option<String>,
     pub openai_compatible_api_key: Option<String>,
@@ -134,11 +151,20 @@ impl std::fmt::Debug for Config {
             .field("exa_api_url", &self.exa_api_url)
             .field("exa_api_key", &mask(&self.exa_api_key))
             .field("exa_enabled", &self.exa_enabled)
+            .field("tavily_keyless", &self.tavily_keyless)
+            .field("firecrawl_keyless", &self.firecrawl_keyless)
+            .field("exa_keyless", &self.exa_keyless)
+            .field("duckduckgo_enabled", &self.duckduckgo_enabled)
+            .field("duckduckgo_region", &self.duckduckgo_region)
+            .field("bing_enabled", &self.bing_enabled)
+            .field("bing_market", &self.bing_market)
             .field("source_providers", &self.source_providers)
             .field("default_extra_sources", &self.default_extra_sources)
             .field("fallback_sources", &self.fallback_sources)
             .field("fetch_max_chars", &self.fetch_max_chars)
             .field("cache_size", &self.cache_size)
+            .field("result_cache_size", &self.result_cache_size)
+            .field("result_cache_ttl_seconds", &self.result_cache_ttl_seconds)
             .field("timeout", &self.timeout)
             .field("openai_compatible_api_url", &self.openai_compatible_api_url)
             .field(
@@ -185,11 +211,20 @@ struct ConfigFile {
     exa_api_url: Option<String>,
     exa_api_key: Option<String>,
     exa_enabled: Option<bool>,
+    tavily_keyless: Option<bool>,
+    firecrawl_keyless: Option<bool>,
+    exa_keyless: Option<bool>,
+    duckduckgo_enabled: Option<bool>,
+    duckduckgo_region: Option<String>,
+    bing_enabled: Option<bool>,
+    bing_market: Option<String>,
     source_providers: Option<Vec<String>>,
     default_extra_sources: Option<usize>,
     fallback_sources: Option<usize>,
     fetch_max_chars: Option<usize>,
     cache_size: Option<usize>,
+    result_cache_size: Option<usize>,
+    result_cache_ttl_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
     openai_compatible_api_url: Option<String>,
     openai_compatible_api_key: Option<String>,
@@ -245,6 +280,19 @@ impl ConfigFile {
         insert("EXA_API_URL", self.exa_api_url);
         insert("EXA_API_KEY", self.exa_api_key);
         insert("EXA_ENABLED", self.exa_enabled.map(|b| b.to_string()));
+        insert("TAVILY_KEYLESS", self.tavily_keyless.map(|b| b.to_string()));
+        insert(
+            "FIRECRAWL_KEYLESS",
+            self.firecrawl_keyless.map(|b| b.to_string()),
+        );
+        insert("EXA_KEYLESS", self.exa_keyless.map(|b| b.to_string()));
+        insert(
+            "DUCKDUCKGO_ENABLED",
+            self.duckduckgo_enabled.map(|b| b.to_string()),
+        );
+        insert("DUCKDUCKGO_REGION", self.duckduckgo_region);
+        insert("BING_ENABLED", self.bing_enabled.map(|b| b.to_string()));
+        insert("BING_MARKET", self.bing_market);
         insert(
             "GROK_SEARCH_SOURCE_PROVIDERS",
             self.source_providers.map(|list| list.join(",")),
@@ -264,6 +312,14 @@ impl ConfigFile {
         insert(
             "GROK_SEARCH_CACHE_SIZE",
             self.cache_size.map(|n| n.to_string()),
+        );
+        insert(
+            "GROK_SEARCH_RESULT_CACHE_SIZE",
+            self.result_cache_size.map(|n| n.to_string()),
+        );
+        insert(
+            "GROK_SEARCH_RESULT_CACHE_TTL_SECONDS",
+            self.result_cache_ttl_seconds.map(|n| n.to_string()),
         );
         insert(
             "GROK_SEARCH_TIMEOUT_SECONDS",
@@ -409,11 +465,26 @@ impl Config {
                 .cloned()
                 .filter(|value| !value.trim().is_empty()),
             exa_enabled: bool_value(&map, "EXA_ENABLED", true),
+            tavily_keyless: bool_value(&map, "TAVILY_KEYLESS", false),
+            firecrawl_keyless: bool_value(&map, "FIRECRAWL_KEYLESS", false),
+            exa_keyless: bool_value(&map, "EXA_KEYLESS", false),
+            duckduckgo_enabled: bool_value(&map, "DUCKDUCKGO_ENABLED", true),
+            duckduckgo_region: map
+                .get("DUCKDUCKGO_REGION")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+            bing_enabled: bool_value(&map, "BING_ENABLED", true),
+            bing_market: map
+                .get("BING_MARKET")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
             source_providers: csv_list(&map, "GROK_SEARCH_SOURCE_PROVIDERS"),
             default_extra_sources: usize_value(&map, "GROK_SEARCH_EXTRA_SOURCES", 3),
             fallback_sources: usize_value(&map, "GROK_SEARCH_FALLBACK_SOURCES", 5),
             fetch_max_chars: optional_positive_usize(&map, "GROK_SEARCH_FETCH_MAX_CHARS"),
             cache_size: usize_value(&map, "GROK_SEARCH_CACHE_SIZE", 256),
+            result_cache_size: usize_value(&map, "GROK_SEARCH_RESULT_CACHE_SIZE", 50),
+            result_cache_ttl_seconds: u64_value(&map, "GROK_SEARCH_RESULT_CACHE_TTL_SECONDS", 300),
             timeout: Duration::from_secs(u64_value(&map, "GROK_SEARCH_TIMEOUT_SECONDS", 60)),
             openai_compatible_api_url: map
                 .get("OPENAI_COMPATIBLE_API_URL")
@@ -454,7 +525,7 @@ impl Config {
 
     pub fn redacted_diagnostics(&self) -> String {
         format!(
-            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} default_extra_sources={} fallback_sources={} timeout_seconds={} github_token={}",
+            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} github_token={}",
             redact_url(&self.grok_api_url),
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
@@ -469,16 +540,38 @@ impl Config {
             redact(self.firecrawl_api_key.as_deref()),
             redact(self.tinyfish_api_key.as_deref()),
             redact(self.exa_api_key.as_deref()),
+            self.tavily_keyless,
+            self.firecrawl_keyless,
+            self.exa_keyless,
+            self.duckduckgo_enabled,
+            self.bing_enabled,
             self.default_extra_sources,
             self.fallback_sources,
+            self.result_cache_size,
+            self.result_cache_ttl_seconds,
             self.timeout.as_secs(),
             self.github_token_status()
         )
     }
 }
 
-/// The four search sources the web settings editor manages.
+/// The four search sources the web settings editor manages (key'd providers
+/// with editable `*_enabled` / `*_api_key` toggles). Keyless engines
+/// (DuckDuckGo, Bing) are configured only via `source_providers` / env and are
+/// intentionally absent from this map so the editor doesn't render toggles for
+/// providers that have no key to manage.
 const ALLOWED_SOURCE_NAMES: [&str; 4] = ["tavily", "exa", "tinyfish", "firecrawl"];
+
+/// Every provider name `source_providers` may legitimately reference, including
+/// the keyless engines. Used for validation and the error's valid-name list.
+const KNOWN_SOURCE_NAMES: [&str; 6] = [
+    "tavily",
+    "exa",
+    "tinyfish",
+    "duckduckgo",
+    "bing",
+    "firecrawl",
+];
 
 /// Maximum accepted length for a submitted API-key value. Generous enough for
 /// any real key, small enough that a spam body can't blow up the file.
@@ -602,11 +695,11 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
     if let Some(list) = &edits.source_providers {
         for name in list {
             let normalized = normalize_source_provider(name);
-            if !ALLOWED_SOURCE_NAMES.contains(&normalized.as_str()) {
+            if !KNOWN_SOURCE_NAMES.contains(&normalized.as_str()) {
                 errors.push(FieldError {
                     field: "source_providers".to_string(),
                     message: format!(
-                        "unknown source provider \"{name}\" (valid: tavily, exa, tinyfish, firecrawl)"
+                        "unknown source provider \"{name}\" (valid: tavily, exa, tinyfish, duckduckgo, bing, firecrawl)"
                     ),
                 });
                 break;
@@ -1531,7 +1624,19 @@ mod source_config_api_tests {
         })
         .is_empty());
         assert!(!validate_edits(&SourceEdits {
-            source_providers: Some(vec!["bing".to_string()]),
+            source_providers: Some(vec!["searxng".to_string()]),
+            ..Default::default()
+        })
+        .is_empty());
+        // Keyless engines are valid chain entries even though the editor map
+        // doesn't manage them.
+        assert!(validate_edits(&SourceEdits {
+            source_providers: Some(vec!["Bing".to_string(), "bing".to_string()]),
+            ..Default::default()
+        })
+        .is_empty());
+        assert!(validate_edits(&SourceEdits {
+            source_providers: Some(vec!["duckduckgo".to_string()]),
             ..Default::default()
         })
         .is_empty());
