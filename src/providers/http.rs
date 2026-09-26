@@ -161,13 +161,13 @@ pub fn build_client(timeout: Duration) -> Client {
 /// none):
 ///
 /// * `keyed`   — the shared keyed-provider client (Tavily / Exa / TinyFish /
-///               Firecrawl). Carries a fixed `NOVA_PROXY_KEY` when that value is
-///               a plain URL; when it names `{account}`, per-provider clients
-///               live in the override map instead.
+///   Firecrawl). Carries a fixed `NOVA_PROXY_KEY` when that value is
+///   a plain URL; when it names `{account}`, per-provider clients
+///   live in the override map instead.
 /// * `keyless` — DuckDuckGo / Bing + specialist extractors + generic fetch
-///               (`NOVA_PROXY_KEYLESS`)
+///   (`NOVA_PROXY_KEYLESS`)
 /// * `grok`    — the Grok engine's own proxy (`NOVA_PROXY_GROK`); unset means
-///               direct, and it may name `{account}` like the keyed template
+///   direct, and it may name `{account}` like the keyed template
 #[derive(Clone)]
 pub struct HttpClients {
     pub keyed: Client,
@@ -251,7 +251,7 @@ impl HttpClients {
         let grok_proxy = resolve_keyed_proxy(proxy_grok, "grok", grok_key);
 
         let mut keyed_overrides = std::collections::HashMap::new();
-        if proxy_key.map_or(false, |t| t.contains(PROXY_ACCOUNT_PLACEHOLDER)) {
+        if proxy_key.is_some_and(|t| t.contains(PROXY_ACCOUNT_PLACEHOLDER)) {
             for &(provider, key) in keyed_keys {
                 if let Some(resolved) = resolve_keyed_proxy(proxy_key, provider, key) {
                     keyed_overrides
