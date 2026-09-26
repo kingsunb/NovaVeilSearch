@@ -216,6 +216,8 @@ the chain falls through to the next provider.
 
 Supplemental sources and generic (non-specialist) fetch walk an ordered provider chain; the first provider with usable output wins and later ones are pure fallback. Providers that cannot honor domain/recency filters (Firecrawl, and Exa in keyless mode) are skipped for filtered requests. The whole chain shares one request deadline (`GROK_SEARCH_TIMEOUT_SECONDS`) — a slow provider cannot multiply the budget by the chain length.
 
+Set `GROK_SEARCH_PARALLEL_SOURCES=true` to fan out instead: every configured provider is consulted concurrently under the same deadline and their results are merged (deduped by URL, earlier chain positions win) and returned in full — there is no `extra_sources`/`fallback_sources` count cap, only identical-URL dedupe. Per-source `provider` labels stay at each provider's native name (no `_enrichment`/`_fallback` suffix), and the query-result cache is bypassed in this mode.
+
 `web_map` is a separate capability, not part of this chain: it always uses Tavily whenever `TAVILY_API_KEY` is configured, even when the chain excludes Tavily.
 
 **The chain and the specialist extractors are different things.** A *source provider* (Tavily, Exa, TinyFish, DuckDuckGo, Bing, Firecrawl) is an external service — the first four are normally gated behind an API key, the last two are keyless scrapers. A *specialist extractor* (GitHub, StackExchange, arXiv, Wikipedia) is a key-free parser for one family of URLs; it is never configured and never part of the chain. So with **no source provider configured at all**, `web_fetch` still handles those four families, and fails on every ordinary URL — there is nothing left that can retrieve one. Inline enrichment in `web_search` behaves the same way and says so by name.
@@ -223,6 +225,7 @@ Supplemental sources and generic (non-specialist) fetch walk an ordered provider
 | Variable | Default | Description |
 |---|---|---|
 | `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Comma-separated explicit chain order, e.g. `tinyfish,tavily,firecrawl` (valid names: `tavily`, `exa`, `tinyfish`, `duckduckgo`, `bing`, `firecrawl`). Unset = configured providers in canonical order `tavily, exa, tinyfish, duckduckgo, bing, firecrawl`. Unknown names fail at startup. |
+| `GROK_SEARCH_PARALLEL_SOURCES` | `false` | `true` = fan out to every configured provider concurrently and merge + dedupe their results, instead of the sequential first-wins chain. |
 
 ## Cache
 

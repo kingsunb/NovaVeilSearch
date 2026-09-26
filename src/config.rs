@@ -77,6 +77,11 @@ pub struct Config {
     pub result_cache_size: usize,
     pub result_cache_ttl_seconds: u64,
     pub timeout: Duration,
+    /// Fan out to every configured source provider in parallel (merge their
+    /// results, deduping by URL in chain order) instead of walking the chain
+    /// sequentially and stopping at the first provider with results. Default
+    /// off: the sequential first-wins chain is the long-standing behavior.
+    pub parallel_sources: bool,
     pub openai_compatible_api_url: Option<String>,
     pub openai_compatible_api_key: Option<String>,
     pub openai_compatible_model: Option<String>,
@@ -183,6 +188,7 @@ impl std::fmt::Debug for Config {
             .field("result_cache_size", &self.result_cache_size)
             .field("result_cache_ttl_seconds", &self.result_cache_ttl_seconds)
             .field("timeout", &self.timeout)
+            .field("parallel_sources", &self.parallel_sources)
             .field("openai_compatible_api_url", &self.openai_compatible_api_url)
             .field(
                 "openai_compatible_api_key",
@@ -246,6 +252,7 @@ struct ConfigFile {
     result_cache_size: Option<usize>,
     result_cache_ttl_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
+    parallel_sources: Option<bool>,
     openai_compatible_api_url: Option<String>,
     openai_compatible_api_key: Option<String>,
     openai_compatible_model: Option<String>,
@@ -347,6 +354,10 @@ impl ConfigFile {
         insert(
             "GROK_SEARCH_TIMEOUT_SECONDS",
             self.timeout_seconds.map(|n| n.to_string()),
+        );
+        insert(
+            "GROK_SEARCH_PARALLEL_SOURCES",
+            self.parallel_sources.map(|b| b.to_string()),
         );
         insert("OPENAI_COMPATIBLE_API_URL", self.openai_compatible_api_url);
         insert("OPENAI_COMPATIBLE_API_KEY", self.openai_compatible_api_key);
@@ -521,6 +532,7 @@ impl Config {
             result_cache_size: usize_value(&map, "GROK_SEARCH_RESULT_CACHE_SIZE", 50),
             result_cache_ttl_seconds: u64_value(&map, "GROK_SEARCH_RESULT_CACHE_TTL_SECONDS", 300),
             timeout: Duration::from_secs(u64_value(&map, "GROK_SEARCH_TIMEOUT_SECONDS", 60)),
+            parallel_sources: bool_value(&map, "GROK_SEARCH_PARALLEL_SOURCES", false),
             openai_compatible_api_url: map
                 .get("OPENAI_COMPATIBLE_API_URL")
                 .cloned()
@@ -560,7 +572,7 @@ impl Config {
 
     pub fn redacted_diagnostics(&self) -> String {
         format!(
-            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} proxy_grok={} proxy_key={} proxy_keyless={} github_token={}",
+            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} parallel_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} proxy_grok={} proxy_key={} proxy_keyless={} github_token={}",
             redact_url(&self.grok_api_url),
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
@@ -582,6 +594,7 @@ impl Config {
             self.bing_enabled,
             self.default_extra_sources,
             self.fallback_sources,
+            self.parallel_sources,
             self.result_cache_size,
             self.result_cache_ttl_seconds,
             self.timeout.as_secs(),
@@ -1040,6 +1053,9 @@ pub const CONFIG_TEMPLATE: &str = r#"# nova-veil-search global configuration
 # ── Behavior tuning ───────────────────────────────────────────
 # default_extra_sources = 3
 # fallback_sources      = 5
+# parallel_sources      = false  # true = fan out to ALL configured source
+#                                # providers at once (merge + dedupe) instead of
+#                                # stopping at the first provider with results
 # fetch_max_chars       = 200000      # per-request char cap on web_fetch
 # cache_size            = 256
 # timeout_seconds       = 60

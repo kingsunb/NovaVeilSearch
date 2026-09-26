@@ -967,8 +967,17 @@ impl SearchService {
         }
 
         let mut enrichment = raw.sources;
-        enrichment.truncate(effective_extra_sources);
-        let enrichment = with_provider(enrichment, enrichment_label(raw.origin));
+        // Sequential mode slices the single chain result to the extra_sources
+        // budget; parallel mode returns the full merged set untouched (its
+        // only culling is identical-URL dedupe inside the fan-out itself).
+        if !self.config.parallel_sources {
+            enrichment.truncate(effective_extra_sources);
+        }
+        let enrichment = if self.config.parallel_sources {
+            enrichment
+        } else {
+            with_provider(enrichment, enrichment_label(raw.origin))
+        };
         let merged = merge_sources(response.sources, enrichment);
         // SRCH-04 dual gate (zero-regression): skip enrichment when the caller
         // opted out OR there are no supplemental sources. Gating on
@@ -1043,6 +1052,11 @@ impl SearchService {
             return RawSources::empty(vec![SourceNote::config(
                 "source fan-out disabled (extra_sources and fallback_sources are both 0)",
             )]);
+        }
+        if self.config.parallel_sources {
+            return self
+                .fetch_raw_sources_parallel(query, count, filters, deadline)
+                .await;
         }
         let cache_key = self.query_cache_key(query, count, filters);
         if let Some((cached, origin)) = self.query_cache.lock().await.get(&cache_key) {
@@ -1136,6 +1150,162 @@ impl SearchService {
         RawSources::empty(notes)
     }
 
+    /// Parallel fan-out over every configured source provider. Unlike the
+    /// sequential chain, no provider is dropped once an earlier one answers:
+    /// they all run concurrently under the single shared request deadline, and
+    /// their results are merged (deduped by URL, earlier chain positions win)
+    /// and returned in full — no per-path source-count cap, so more engines
+    /// mean more results. Total latency is roughly the slowest provider, not
+    /// the sum of every fallback step.
+    ///
+    /// The merged result has no single `origin`, so per-source labels stay at
+    /// the providers' native names; the caller preserves them (via
+    /// [`Config::parallel_sources`]) instead of overwriting with a
+    /// `{origin}_enrichment` / `{origin}_fallback` label. The query-result
+    /// cache is also bypassed: its key does not encode the fan-out mode, and a
+    /// cached single-provider result must not masquerade as a parallel merge
+    /// (or vice versa).
+    async fn fetch_raw_sources_parallel(
+        &self,
+        query: &str,
+        count: usize,
+        filters: &SearchFilters,
+        deadline: tokio::time::Instant,
+    ) -> RawSources {
+        let mut notes = Vec::new();
+        let mut active: Vec<SourceEntry> = Vec::new();
+        for slot in self.source_slots.iter() {
+            match slot {
+                SourceSlot::Active(entry) => {
+                    // Same filter gate as the sequential chain: a provider that
+                    // cannot honor domain/recency filters must not serve a
+                    // filter-constrained request.
+                    if !filters.is_empty() && !entry.spec.supports_filters {
+                        notes.push(SourceNote::no_results(format!(
+                            "{}: skipped (request carries domain/recency filters, which {} cannot honor)",
+                            entry.spec.name, entry.spec.name
+                        )));
+                        continue;
+                    }
+                    active.push(entry.clone());
+                }
+                SourceSlot::Missing { spec, enabled } => {
+                    let unavailable = unavailable_note(
+                        spec.name,
+                        *enabled,
+                        spec.enable_var,
+                        spec.key_var,
+                        spec.header,
+                    );
+                    notes.push(if !filters.is_empty() && !spec.supports_filters {
+                        SourceNote::new(
+                            unavailable.kind,
+                            format!(
+                                "{} — also skipped (request carries domain/recency filters, which {} cannot honor)",
+                                unavailable.detail, spec.name
+                            ),
+                        )
+                    } else {
+                        unavailable
+                    });
+                }
+            }
+        }
+
+        // Fire every eligible provider at once. `JoinSet::spawn` demands a
+        // `'static` future, so the borrowed query/filters are cloned into each
+        // task; each call is still bounded by the request's global deadline so
+        // a straggler cannot extend the whole call.
+        let mut set = tokio::task::JoinSet::new();
+        for entry in active {
+            let query = query.to_owned();
+            let filters = filters.clone();
+            set.spawn(async move {
+                let name = entry.spec.name;
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    entry.provider.search_sources(&query, count, &filters),
+                )
+                .await;
+                (name, attempt)
+            });
+        }
+
+        // Collect per-provider outcomes keyed by name so results can be merged
+        // in chain order (not completion order) below.
+        let mut per_provider: std::collections::HashMap<&'static str, Vec<Source>> =
+            std::collections::HashMap::new();
+        while let Some(joined) = set.join_next().await {
+            let (name, attempt) = match joined {
+                Ok(pair) => pair,
+                Err(err) => {
+                    notes.push(SourceNote::broken(format!(
+                        "source fan-out: a provider task panicked or was cancelled: {err}"
+                    )));
+                    continue;
+                }
+            };
+            match attempt {
+                Ok(Ok(sources)) => match usable_or_note(name, sources) {
+                    Ok(usable) => {
+                        per_provider.insert(name, usable);
+                    }
+                    Err(note) => notes.push(note),
+                },
+                Ok(Err(err)) => notes.push(SourceNote::broken(format!("{name}: {err}"))),
+                Err(_elapsed) => notes.push(SourceNote::broken(format!(
+                    "{name}: timed out (request deadline reached)"
+                ))),
+            }
+        }
+
+        // Merge with a round-robin interleave over the configured chain order.
+        // A naive chain-order concatenation would let the first provider fill
+        // the whole budget and starve the rest — defeating the point of a
+        // fan-out. Interleaving one source per provider per pass keeps several
+        // engines represented, while earlier chain positions still win URL ties.
+        //
+        // No truncation here: the caller wants every distinct URL the
+        // providers turned up, so the only culling is identical-URL dedupe.
+        let mut lists: Vec<Vec<Source>> = Vec::new();
+        for slot in self.source_slots.iter() {
+            if let SourceSlot::Active(entry) = slot {
+                if let Some(sources) = per_provider.remove(entry.spec.name) {
+                    lists.push(sources);
+                }
+            }
+        }
+        let mut merged: Vec<Source> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cursor: Vec<usize> = vec![0; lists.len()];
+        loop {
+            let mut advanced = false;
+            for (index, list) in lists.iter().enumerate() {
+                if cursor[index] < list.len() {
+                    let source = list[cursor[index]].clone();
+                    cursor[index] += 1;
+                    advanced = true;
+                    if seen.insert(source.url.clone()) {
+                        merged.push(source);
+                    }
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+
+        if merged.is_empty() {
+            RawSources::empty(notes)
+        } else {
+            RawSources {
+                sources: merged,
+                origin: None,
+                notes,
+            }
+        }
+    }
+
     /// Deterministic cache key for the supplemental fan-out: normalized query
     /// plus the full filter signature (sorted domain lists and recency). Two
     /// requests that differ only in case, whitespace, or domain ordering map
@@ -1171,8 +1341,16 @@ impl SearchService {
             notes,
         } = raw;
         let mut fallback = sources;
-        fallback.truncate(self.config.fallback_sources);
-        let fallback = with_provider(fallback, fallback_label(origin));
+        // Same split as the success path: sequential mode trims to the
+        // fallback_sources budget, parallel mode returns every distinct URL.
+        if !self.config.parallel_sources {
+            fallback.truncate(self.config.fallback_sources);
+        }
+        let fallback = if self.config.parallel_sources {
+            fallback
+        } else {
+            with_provider(fallback, fallback_label(origin))
+        };
         // A metadata-only Grok response — citations but no prose — routes here
         // as `grok_content_empty`, and its citations are real evidence. Merge
         // them rather than dropping them: they keep their `grok_responses`
@@ -1539,6 +1717,7 @@ impl SearchService {
             },
             "default_extra_sources": self.config.default_extra_sources,
             "fallback_sources": self.config.fallback_sources,
+            "parallel_sources": self.config.parallel_sources,
             "cache_size": self.config.cache_size,
             "timeout_seconds": self.config.timeout.as_secs(),
             "github_token": self.config.github_token_status(),
@@ -2056,7 +2235,18 @@ mod chain_tests {
     }
 
     fn chain_service(slots: Vec<SourceSlot>, ai: Arc<dyn AiProvider>) -> SearchService {
-        let config = Config::from_env_map([("GROK_SEARCH_API_KEY", "fake")]);
+        chain_service_with_config(
+            Config::from_env_map([("GROK_SEARCH_API_KEY", "fake")]),
+            slots,
+            ai,
+        )
+    }
+
+    fn chain_service_with_config(
+        config: Config,
+        slots: Vec<SourceSlot>,
+        ai: Arc<dyn AiProvider>,
+    ) -> SearchService {
         SearchService {
             default_model: resolve_default_model(&config),
             config,
@@ -2110,6 +2300,65 @@ mod chain_tests {
             out.sources
                 .iter()
                 .map(|source| source.provider.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_sources_fans_out_to_all_providers_and_keeps_native_labels() {
+        let config = Config::from_env_map([
+            ("GROK_SEARCH_API_KEY", "fake"),
+            ("GROK_SEARCH_PARALLEL_SOURCES", "true"),
+        ]);
+        let svc = chain_service_with_config(
+            config,
+            vec![
+                SourceSlot::Active(SourceEntry {
+                    spec: &TAVILY_SPEC,
+                    provider: Arc::new(NamedSourceProvider("tavily")),
+                }),
+                SourceSlot::Active(SourceEntry {
+                    spec: &TINYFISH_SPEC,
+                    provider: Arc::new(NamedSourceProvider("tinyfish")),
+                }),
+            ],
+            Arc::new(ErrAiProvider),
+        );
+        let out = svc
+            .web_search(concise_input())
+            .await
+            .expect("parallel fallback output");
+        assert!(out.fallback_used);
+        assert!(!out.sources.is_empty());
+
+        let providers: Vec<&str> = out
+            .sources
+            .iter()
+            .map(|source| source.provider.as_ref())
+            .collect();
+        assert!(
+            providers.contains(&"tavily"),
+            "expected tavily to contribute, got: {providers:?}"
+        );
+        assert!(
+            providers.contains(&"tinyfish"),
+            "expected tinyfish to contribute, got: {providers:?}"
+        );
+        assert!(
+            !providers.iter().any(|label| label.ends_with("_fallback")),
+            "parallel mode keeps native per-provider labels, got: {providers:?}"
+        );
+
+        // No count cap: both providers return 5 results each and all 10 survive
+        // (nothing to dedupe — different URL prefixes), rather than being
+        // truncated to the fallback_sources budget.
+        assert_eq!(
+            out.sources.len(),
+            10,
+            "parallel mode returns every result, got: {:?}",
+            out.sources
+                .iter()
+                .map(|source| source.url.clone())
                 .collect::<Vec<_>>()
         );
     }

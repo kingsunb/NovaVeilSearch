@@ -185,6 +185,7 @@ Notes:
 | `FIRECRAWL_KEYLESS` | `false` | Run Firecrawl's hosted `/v2` endpoints with no key. |
 | `EXA_KEYLESS` | `false` | Use Exa's public MCP `web_search_exa` (search-only; no `web_fetch` / filters). |
 | `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Explicit chain order, e.g. `tinyfish,tavily,firecrawl`. Unset = canonical order `tavily, exa, tinyfish, duckduckgo, bing, firecrawl` over configured providers. |
+| `GROK_SEARCH_PARALLEL_SOURCES` | `false` | `true` = fan out to every configured provider concurrently, merge + dedupe by URL, and return them in full (no `extra_sources`/`fallback_sources` cap), instead of the sequential first-wins chain. |
 | `GROK_SEARCH_CACHE_SIZE` | `256` | Max cached `web_search` sessions. |
 | `GROK_SEARCH_RESULT_CACHE_SIZE` | `50` | Max cached query→sources entries (LRU) deduplicating provider searches. |
 | `GROK_SEARCH_RESULT_CACHE_TTL_SECONDS` | `300` | Per-entry age limit for the query‑result cache; `0` disables it. |
