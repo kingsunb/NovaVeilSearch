@@ -40,6 +40,17 @@ services:
       # Operator-fixed gateway/model defaults (optional).
       # GROK_SEARCH_URL: "https://api.x.ai"
       # GROK_SEARCH_MODEL: "grok-4-1-fast-reasoning"
+      # ── Outbound proxy (all OFF by default; empty = direct) ────────────────
+      # NOVA_PROXY_KEY     = keyed providers  (Tavily/Exa/TinyFish/Firecrawl)
+      # NOVA_PROXY_KEYLESS = keyless engines  (DuckDuckGo/Bing + specialists)
+      # NOVA_PROXY_GROK    = Grok engine proxy (URL; unset = direct)
+      # Schemes: http://, https://, socks5://, socks5h:// (creds supported).
+      # Any may name an {account} placeholder in the username for a per-key
+      # alias per keyed provider, e.g.:
+      #   NOVA_PROXY_KEY=socks5h://Default.{account}:123@resin:2260
+      # NOVA_PROXY_KEY: "${NOVA_PROXY_KEY:-}"
+      # NOVA_PROXY_KEYLESS: "${NOVA_PROXY_KEYLESS:-}"
+      # NOVA_PROXY_GROK: "${NOVA_PROXY_GROK:-}"
       # Keys are always server-side here; callers never supply their own.
     expose:
       - "8080"

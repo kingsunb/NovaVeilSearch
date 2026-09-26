@@ -435,7 +435,10 @@ pub fn validate_source_providers(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn build_source_slots(config: &Config, http: &reqwest::Client) -> Result<Vec<SourceSlot>> {
+fn build_source_slots(
+    config: &Config,
+    clients: &crate::providers::http::HttpClients,
+) -> Result<Vec<SourceSlot>> {
     validate_source_providers(config)?;
     let explicit = !config.source_providers.is_empty();
     let specs: Vec<&'static ProviderSpec> = if explicit {
@@ -455,7 +458,14 @@ fn build_source_slots(config: &Config, http: &reqwest::Client) -> Result<Vec<Sou
 
     let mut slots = Vec::new();
     for spec in specs {
-        match instantiate_source(spec, config, http) {
+        // Keyless engines (DuckDuckGo/Bing, key_var == "") route through the
+        // keyless proxy; every keyed provider routes through the keyed proxy.
+        let client = if spec.key_var.is_empty() {
+            &clients.keyless
+        } else {
+            clients.keyed_client(spec.name)
+        };
+        match instantiate_source(spec, config, client) {
             Some(provider) => slots.push(SourceSlot::Active(SourceEntry { spec, provider })),
             None if spec.core || explicit => slots.push(SourceSlot::Missing {
                 spec,
@@ -501,7 +511,7 @@ pub struct SearchService {
 /// rebuilt when the caller's keys change. [`build_providers`] constructs these
 /// from a [`Config`]; [`SearchService::new`] uses it with a process-wide config
 /// (the stdio path), and [`SearchService::with_config`] uses it per request
-/// while sharing the long-lived HTTP client and source cache.
+/// while sharing the long-lived source cache.
 struct ProviderSet {
     ai: Arc<dyn AiProvider>,
     default_model: String,
@@ -509,11 +519,15 @@ struct ProviderSet {
     source_router: Arc<crate::sources::SourceRouter>,
 }
 
-/// Build the credential-bearing providers for a given `config`, reusing the
-/// shared `http` client. Extracted from the original `SearchService::new`
-/// body so both the process-wide (stdio) and per-request (HTTP) construction
-/// paths share one implementation.
-fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSet> {
+/// Build the credential-bearing providers for a given `config`, using the
+/// three shared clients (keyed / keyless / grok) from the proxy dispatcher.
+/// Extracted from the original `SearchService::new` body so both the
+/// process-wide (stdio) and per-request (HTTP) construction paths share one
+/// implementation.
+fn build_providers(
+    config: &Config,
+    clients: &crate::providers::http::HttpClients,
+) -> Result<ProviderSet> {
     use crate::config::Transport;
 
     let ai: Arc<dyn AiProvider> = match config.transport {
@@ -537,11 +551,11 @@ fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSe
                                         .to_string(),
                                 )
                             })?;
-                        Arc::new(OAuthCredential::new(http.clone(), auth_path))
+                        Arc::new(OAuthCredential::new(clients.grok.clone(), auth_path))
                     }
                 };
             Arc::new(GrokResponsesProvider::with_credential_client(
-                http.clone(),
+                clients.grok.clone(),
                 config.grok_api_url.clone(),
                 credential,
                 config.web_search_enabled,
@@ -566,7 +580,7 @@ fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSe
             }
             Arc::new(
                 crate::providers::openai_compatible::OpenAICompatProvider::with_client(
-                    http.clone(),
+                    clients.grok.clone(),
                     url,
                     key,
                     model,
@@ -576,7 +590,7 @@ fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSe
         }
     };
 
-    let source_slots = build_source_slots(config, http)?;
+    let source_slots = build_source_slots(config, clients)?;
 
     let source_router = Arc::new(crate::sources::SourceRouter::from_config(config));
 
@@ -586,6 +600,32 @@ fn build_providers(config: &Config, http: &reqwest::Client) -> Result<ProviderSe
         source_slots,
         source_router,
     })
+}
+
+/// Build the outbound HTTP clients from a config's proxy settings: keyed
+/// providers, keyless providers, and the Grok engine. Single construction point
+/// so both the stdio (`SearchService::new`) and per-request (`with_config`)
+/// paths derive their clients identically. `{account}` placeholders in any of
+/// the three proxy values resolve per provider key here.
+fn proxy_clients(config: &Config) -> crate::providers::http::HttpClients {
+    let keyed_keys: &[(&'static str, Option<&str>)] = &[
+        ("tavily", config.tavily_api_key.as_deref()),
+        ("exa", config.exa_api_key.as_deref()),
+        ("tinyfish", config.tinyfish_api_key.as_deref()),
+        ("firecrawl", config.firecrawl_api_key.as_deref()),
+    ];
+    let grok_key = config
+        .grok_api_key
+        .as_deref()
+        .or(config.openai_compatible_api_key.as_deref());
+    crate::providers::http::HttpClients::build(
+        config.timeout,
+        config.proxy_key.as_deref(),
+        config.proxy_keyless.as_deref(),
+        config.proxy_grok.as_deref(),
+        keyed_keys,
+        grok_key,
+    )
 }
 
 /// Non-reversible per-tenant namespace tag derived from the caller's primary
@@ -615,36 +655,38 @@ fn tenant_tag(config: &Config) -> String {
 
 impl SearchService {
     pub fn new(config: Config) -> Result<Self> {
-        let http = crate::providers::http::build_client(config.timeout);
-        let providers = build_providers(&config, &http)?;
+        let clients = proxy_clients(&config);
+        let providers = build_providers(&config, &clients)?;
         let cache = Arc::new(Mutex::new(SourceCache::new(config.cache_size)));
-        Ok(Self::from_parts(config, http, cache, providers))
+        Ok(Self::from_parts(config, clients.keyless, cache, providers))
     }
 
-    /// Build a request-scoped service that reuses this service's shared HTTP
-    /// client and source cache, but derives every credential-bearing provider
-    /// from `config`. The HTTP transport calls this per request so each caller
-    /// searches with their own keys while the process keeps a single source
-    /// cache — so `get_sources` continuation still works across requests.
+    /// Build a request-scoped service that reuses this service's shared source
+    /// cache, but derives every credential-bearing provider (and its proxy
+    /// routing) from `config`. The HTTP transport calls [`for_request`] directly,
+    /// passing the server's shared clients; this method instead re-derives plain
+    /// clients from `config` so a caller-supplied config can't smuggle in proxy
+    /// settings that bypass the operator's own `NOVA_PROXY_*` environment.
     ///
     /// OAuth is rejected here: it resolves a single on-disk identity and is
     /// incompatible with per-request, multi-tenant credentials. HTTP callers
     /// must pass an API key. The local stdio path keeps OAuth via [`new`].
     ///
     /// [`new`]: SearchService::new
+    /// [`for_request`]: SearchService::for_request
     pub fn with_config(&self, config: Config) -> Result<Self> {
-        Self::for_request(self.http_client.clone(), self.cache.clone(), config)
+        Self::for_request(proxy_clients(&config), self.cache.clone(), config)
     }
 
-    /// Build a request-scoped service from shared state — a reused HTTP client
-    /// and the process-wide source cache — plus a per-request `config`. This is
-    /// the entrypoint the HTTP transport uses: the server holds the credentials,
-    /// authenticates the request, then constructs a fully-credentialed service
-    /// per request from the server's own keys. OAuth is rejected here (single
-    /// on-disk identity is incompatible with a shared server); a missing
-    /// required key fails at construction (fail-closed).
+    /// Build a request-scoped service from shared state — a reused set of HTTP
+    /// clients and the process-wide source cache — plus a per-request `config`.
+    /// This is the entrypoint the HTTP transport uses: the server holds the
+    /// credentials, authenticates the request, then constructs a
+    /// fully-credentialed service per request from the server's own keys. OAuth
+    /// is rejected here (single on-disk identity is incompatible with a shared
+    /// server); a missing required key fails at construction (fail-closed).
     pub fn for_request(
-        http_client: reqwest::Client,
+        clients: crate::providers::http::HttpClients,
         cache: Arc<Mutex<SourceCache>>,
         config: Config,
     ) -> Result<Self> {
@@ -654,13 +696,14 @@ impl SearchService {
                     .to_string(),
             ));
         }
-        let providers = build_providers(&config, &http_client)?;
-        Ok(Self::from_parts(config, http_client, cache, providers))
+        let providers = build_providers(&config, &clients)?;
+        Ok(Self::from_parts(config, clients.keyless, cache, providers))
     }
 
     /// Assemble a `SearchService` from an already-built provider set plus the
-    /// shared `http` client and `cache`. Single assembly point for both `new`
-    /// (fresh client + cache) and `with_config` (shared client + cache).
+    /// keyless `http` client and the shared `cache`. Single assembly point for
+    /// both `new` (fresh client + cache) and `with_config` (fresh clients +
+    /// shared cache).
     fn from_parts(
         config: Config,
         http: reqwest::Client,
@@ -1363,7 +1406,16 @@ impl SearchService {
                 }
                 _ => None,
             })
-            .or_else(|| instantiate_source(&TAVILY_SPEC, &self.config, &self.http_client))
+            .or_else(|| {
+                let proxy = crate::providers::http::resolve_keyed_proxy(
+                    self.config.proxy_key.as_deref(),
+                    "tavily",
+                    self.config.tavily_api_key.as_deref(),
+                );
+                let client =
+                    crate::providers::http::build_client_with_proxy(self.config.timeout, proxy.as_deref());
+                instantiate_source(&TAVILY_SPEC, &self.config, &client)
+            })
             .ok_or(NovaVeilSearchError::MissingConfig("TAVILY_API_KEY"))?;
         provider.map(url, max_results).await
     }
@@ -1860,8 +1912,17 @@ mod remediation_tests {
 mod chain_tests {
     use super::*;
 
-    fn http() -> reqwest::Client {
-        crate::providers::http::build_client(std::time::Duration::from_secs(5))
+    /// A uniform (unproxied) client set for chain-layout tests — proxy routing
+    /// is orthogonal to what these tests assert.
+    fn clients() -> crate::providers::http::HttpClients {
+        crate::providers::http::HttpClients::build(
+            std::time::Duration::from_secs(5),
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
     }
 
     fn slot_names(slots: &[SourceSlot]) -> Vec<String> {
@@ -1882,7 +1943,7 @@ mod chain_tests {
             ("TINYFISH_API_KEY", "f"),
             ("FIRECRAWL_API_KEY", "c"),
         ]);
-        let slots = build_source_slots(&config, &http()).expect("slots");
+        let slots = build_source_slots(&config, &clients()).expect("slots");
         assert_eq!(
             slot_names(&slots),
             [
@@ -1904,7 +1965,7 @@ mod chain_tests {
     #[test]
     fn default_chain_slots_missing_core_but_omits_missing_optional() {
         let config = Config::from_env_map([("TINYFISH_API_KEY", "f")]);
-        let slots = build_source_slots(&config, &http()).expect("slots");
+        let slots = build_source_slots(&config, &clients()).expect("slots");
         assert_eq!(
             slot_names(&slots),
             [
@@ -1923,14 +1984,14 @@ mod chain_tests {
             ("TINYFISH_API_KEY", "f"),
             ("GROK_SEARCH_SOURCE_PROVIDERS", "tinyfish, Exa"),
         ]);
-        let slots = build_source_slots(&config, &http()).expect("slots");
+        let slots = build_source_slots(&config, &clients()).expect("slots");
         assert_eq!(slot_names(&slots), ["active:tinyfish", "missing:exa"]);
     }
 
     #[test]
     fn unknown_provider_name_fails_construction() {
         let config = Config::from_env_map([("GROK_SEARCH_SOURCE_PROVIDERS", "tavily,serpapi")]);
-        let err = match build_source_slots(&config, &http()) {
+        let err = match build_source_slots(&config, &clients()) {
             Err(err) => err,
             Ok(_) => panic!("must reject unknown provider name"),
         };

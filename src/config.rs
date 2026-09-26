@@ -51,6 +51,20 @@ pub struct Config {
     pub bing_enabled: bool,
     /// Optional Bing market (`mkt`, e.g. `en-US`, `zh-CN`). Defaults to `en-US`.
     pub bing_market: Option<String>,
+    /// Outbound proxy for the keyed source providers (Tavily/Exa/TinyFish/
+    /// Firecrawl). Accepts `http://`, `https://`, `socks5://`, `socks5h://`
+    /// (optionally with embedded credentials). Empty / unset = direct connection.
+    pub proxy_key: Option<String>,
+    /// Outbound proxy for the keyless providers (DuckDuckGo/Bing) plus the
+    /// specialist extractors (GitHub/StackExchange/arXiv/Wikipedia) and the
+    /// generic page-fetch chain — everything that reaches the internet without a
+    /// provider key. Empty / unset = direct connection.
+    pub proxy_keyless: Option<String>,
+    /// Outbound proxy for the Grok engine. Like `proxy_key` / `proxy_keyless`,
+    /// this is a proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`,
+    /// optionally with credentials, optionally an `{account}` placeholder).
+    /// Empty / unset = Grok connects directly (no proxy).
+    pub proxy_grok: Option<String>,
     /// Explicit source-provider chain order (lowercased names). Empty means
     /// "use the built-in canonical order over whatever is configured".
     pub source_providers: Vec<String>,
@@ -158,6 +172,9 @@ impl std::fmt::Debug for Config {
             .field("duckduckgo_region", &self.duckduckgo_region)
             .field("bing_enabled", &self.bing_enabled)
             .field("bing_market", &self.bing_market)
+            .field("proxy_key", &mask(&self.proxy_key))
+            .field("proxy_keyless", &mask(&self.proxy_keyless))
+            .field("proxy_grok", &mask(&self.proxy_grok))
             .field("source_providers", &self.source_providers)
             .field("default_extra_sources", &self.default_extra_sources)
             .field("fallback_sources", &self.fallback_sources)
@@ -218,6 +235,9 @@ struct ConfigFile {
     duckduckgo_region: Option<String>,
     bing_enabled: Option<bool>,
     bing_market: Option<String>,
+    proxy_key: Option<String>,
+    proxy_keyless: Option<String>,
+    proxy_grok: Option<String>,
     source_providers: Option<Vec<String>>,
     default_extra_sources: Option<usize>,
     fallback_sources: Option<usize>,
@@ -293,6 +313,9 @@ impl ConfigFile {
         insert("DUCKDUCKGO_REGION", self.duckduckgo_region);
         insert("BING_ENABLED", self.bing_enabled.map(|b| b.to_string()));
         insert("BING_MARKET", self.bing_market);
+        insert("NOVA_PROXY_KEY", self.proxy_key);
+        insert("NOVA_PROXY_KEYLESS", self.proxy_keyless);
+        insert("NOVA_PROXY_GROK", self.proxy_grok);
         insert(
             "GROK_SEARCH_SOURCE_PROVIDERS",
             self.source_providers.map(|list| list.join(",")),
@@ -478,6 +501,18 @@ impl Config {
                 .get("BING_MARKET")
                 .cloned()
                 .filter(|value| !value.trim().is_empty()),
+            proxy_key: map
+                .get("NOVA_PROXY_KEY")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+            proxy_keyless: map
+                .get("NOVA_PROXY_KEYLESS")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+            proxy_grok: map
+                .get("NOVA_PROXY_GROK")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
             source_providers: csv_list(&map, "GROK_SEARCH_SOURCE_PROVIDERS"),
             default_extra_sources: usize_value(&map, "GROK_SEARCH_EXTRA_SOURCES", 3),
             fallback_sources: usize_value(&map, "GROK_SEARCH_FALLBACK_SOURCES", 5),
@@ -525,7 +560,7 @@ impl Config {
 
     pub fn redacted_diagnostics(&self) -> String {
         format!(
-            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} github_token={}",
+            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} proxy_grok={} proxy_key={} proxy_keyless={} github_token={}",
             redact_url(&self.grok_api_url),
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
@@ -550,6 +585,9 @@ impl Config {
             self.result_cache_size,
             self.result_cache_ttl_seconds,
             self.timeout.as_secs(),
+            redact(self.proxy_grok.as_deref()),
+            redact(self.proxy_key.as_deref()),
+            redact(self.proxy_keyless.as_deref()),
             self.github_token_status()
         )
     }
@@ -972,6 +1010,17 @@ pub const CONFIG_TEMPLATE: &str = r#"# nova-veil-search global configuration
 # tinyfish_fetch_api_url  = "https://api.fetch.tinyfish.ai"
 # exa_api_url             = "https://api.exa.ai"
 
+# ── Outbound proxy (all off by default) ────────────────────────
+# Route the search providers' outbound requests through a proxy. Empty/unset
+# means a direct connection. Schemes: http://, https://, socks5://, socks5h://
+#   proxy_key     = "socks5://127.0.0.1:1080"  # keyed providers (Tavily/Exa/TinyFish/Firecrawl)
+#   # proxy_key may instead name an {account} placeholder in the username to
+#   # give each keyed provider its own per-key alias on a shared proxy:
+#   #   proxy_key = "socks5h://Default.{account}:123@resin:2260"
+#   proxy_keyless = "socks5://127.0.0.1:1081"  # keyless (DuckDuckGo/Bing + specialists)
+#   proxy_grok    = "socks5://127.0.0.1:1082"  # Grok engine (unset = direct).
+#   # Any of the three may name an {account} placeholder to derive a per-key alias.
+
 # ── OpenAI-compatible transport (alternative to grok_*) ───────
 # Set these three to use a /v1/chat/completions gateway. When grok_api_key
 # above is also set, it wins; otherwise these three pick the chat-completions
@@ -1296,6 +1345,33 @@ mod source_config_tests {
         let cfg = Config::from_env_map(Vec::<(String, String)>::new());
         assert_eq!(cfg.source_max_answers, 5);
         assert_eq!(cfg.source_max_comments, 30);
+    }
+
+    // Proxy is opt-in: every channel is direct until the operator sets a URL,
+    // including Grok (its own `NOVA_PROXY_GROK` URL, unset = direct).
+    #[test]
+    fn proxy_settings_parse_and_default_off() {
+        let unset = Config::from_env_map(Vec::<(String, String)>::new());
+        assert_eq!(unset.proxy_key, None);
+        assert_eq!(unset.proxy_keyless, None);
+        assert_eq!(unset.proxy_grok, None);
+
+        let set = Config::from_env_map([
+            ("NOVA_PROXY_KEY", "socks5://keyed:1080"),
+            ("NOVA_PROXY_KEYLESS", "http://keyless:8080"),
+            ("NOVA_PROXY_GROK", "socks5://grok:1081"),
+        ]);
+        assert_eq!(set.proxy_key.as_deref(), Some("socks5://keyed:1080"));
+        assert_eq!(
+            set.proxy_keyless.as_deref(),
+            Some("http://keyless:8080")
+        );
+        assert_eq!(set.proxy_grok.as_deref(), Some("socks5://grok:1081"));
+
+        // Blank proxy URLs read as absent (direct), mirroring blank-key handling.
+        let blank = Config::from_env_map([("NOVA_PROXY_KEY", "   "), ("NOVA_PROXY_GROK", "  ")]);
+        assert_eq!(blank.proxy_key, None);
+        assert_eq!(blank.proxy_grok, None);
     }
 
     // A blank key must read as absent, not as a configured provider: kept as

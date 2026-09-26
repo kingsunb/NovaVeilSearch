@@ -29,6 +29,7 @@ Which channel carries your config is decided by the MCP **transport**, not a pro
 | Tavily / Firecrawl / Exa anonymous mode | `TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS` |
 | DuckDuckGo / Bing enable & flavor | `DUCKDUCKGO_ENABLED`, `DUCKDUCKGO_REGION`, `BING_ENABLED`, `BING_MARKET` |
 | GitHub token | `GITHUB_TOKEN` |
+| Outbound proxy | `NOVA_PROXY_KEY` / `NOVA_PROXY_KEYLESS` / `NOVA_PROXY_GROK` |
 
 All entries are **operator-fixed** on the remote transport — set once in the server's own environment, never per request. **Two groups are stdio-only:** OAuth (`GROK_SEARCH_AUTH_MODE` / `GROK_SEARCH_AUTH_FILE`) and the OpenAI-compatible chat-completions transport (`OPENAI_COMPATIBLE_API_URL` / `_API_KEY` / `_MODEL`). The remote server serves Grok **Responses** only; to run a chat-completions relay, use the stdio transport.
 
@@ -261,6 +262,37 @@ content; truncated sources carry a note pointing at `web_fetch(url)` /
 | `GROK_SEARCH_MAX_INLINE_SOURCES` | `5` | Maximum sources that carry inline `content` per `web_search` response; the rest return metadata only. |
 | `GROK_SEARCH_RESPONSE_MAX_CHARS` | `60000` | Whole-response character budget (answer + per-source metadata and inline content). Over-budget responses truncate inline content tail-first, then drop trailing sources (always keeping at least one) and set `truncated: true`. |
 
+## Outbound proxy (off by default)
+
+Every upstream connects **directly by default**. Optionally route per category:
+
+| Variable | Default | Description |
+|---|---|---|
+| `NOVA_PROXY_KEY` | unset | Proxy for the **keyed** providers (Tavily / Exa / TinyFish / Firecrawl). |
+| `NOVA_PROXY_KEYLESS` | unset | Proxy for the **keyless** engines (DuckDuckGo / Bing) plus specialist extractors and generic fetch. |
+| `NOVA_PROXY_GROK` | unset | Proxy for the **Grok** engine. Unset = Grok connects directly. |
+
+Schemes: `http://`, `https://`, `socks5://`, `socks5h://`, optionally with
+`user:pass@` credentials. An unparsable URL logs a warning and degrades to direct.
+
+Any of the three accepts an `{account}` placeholder in the **username** to
+derive one proxy sub-account per provider (parity with NovaVeil). The
+placeholder is replaced with a deterministic 8-hex alias — `sha256("provider:key")`'s
+first 8 hex chars, non-reversible — so each keyed provider (Tavily / Exa /
+TinyFish / Firecrawl) lands on its own account from a single template, and Grok
+resolves `{account}` from its own key, and the proxy vendor can track a key
+without ever seeing it. Only the username is substituted; the password and the
+rest of the URL are preserved:
+
+```toml
+proxy_key  = "socks5h://Default.{account}:123@resin:2260"
+proxy_grok = "socks5://grok-only:1080"   # Grok has its own URL; unset = direct
+```
+
+A provider with no key (keyless mode) has nothing to bind an account to, so it
+logs a warning and connects directly. A fixed URL with no placeholder behaves
+exactly as before — all matching providers share it.
+
 ## Config file
 
 Drop a TOML file at `<home>/.config/nova-veil-search/config.toml` (or any path pointed to by `GROK_SEARCH_CONFIG`) to set defaults once and skip the per-client `env` block. Process env still wins, so individual clients can override any field at runtime.
@@ -318,6 +350,9 @@ Unknown keys are rejected by the loader — typos surface as parse errors instea
 | `duckduckgo_region` | `DUCKDUCKGO_REGION` |
 | `bing_enabled` | `BING_ENABLED` |
 | `bing_market` | `BING_MARKET` |
+| `proxy_key` | `NOVA_PROXY_KEY` |
+| `proxy_keyless` | `NOVA_PROXY_KEYLESS` |
+| `proxy_grok` | `NOVA_PROXY_GROK` |
 | `source_providers` | `GROK_SEARCH_SOURCE_PROVIDERS` |
 | `default_extra_sources` | `GROK_SEARCH_EXTRA_SOURCES` |
 | `fallback_sources` | `GROK_SEARCH_FALLBACK_SOURCES` |
@@ -371,6 +406,10 @@ firecrawl_enabled     = true
 # duckduckgo_region   = "us-en"
 # bing_enabled        = true
 # bing_market         = "en-US"
+# proxy_key           = "socks5://proxy-a:1080"   # keyed providers (Tavily/Exa/TinyFish/Firecrawl)
+#                       # or a per-key template: "socks5h://Default.{account}:123@resin:2260"
+# proxy_keyless       = "socks5://proxy-b:1081"   # keyless engines + specialists
+# proxy_grok          = "socks5://proxy-c:1082"   # Grok engine (unset = direct)
 default_extra_sources = 3
 fallback_sources      = 5
 fetch_max_chars       = 200000

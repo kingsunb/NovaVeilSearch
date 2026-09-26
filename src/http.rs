@@ -18,9 +18,10 @@
 //!   (`NOVA_SESSION_TTL_SECONDS`, default 12 h) held in an in-memory store.
 //!
 //! A fully-credentialed [`SearchService`] is built per request via
-//! [`SearchService::for_request`], reusing one shared HTTP client and one
-//! process-wide source cache (so `get_sources` continuation still works across
-//! requests). The whole module is gated behind the `http` feature so the
+//! [`SearchService::for_request`], reusing one shared set of HTTP clients (keyed
+//! / keyless / grok, each honoring the operator's `NOVA_PROXY_*` settings) and
+//! one process-wide source cache (so `get_sources` continuation still works
+//! across requests). The whole module is gated behind the `http` feature so the
 //! default stdio build never links axum.
 //!
 //! TLS terminates upstream (Caddy); this server binds loopback only.
@@ -109,8 +110,10 @@ const SSE_HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// Shared across every request: one connection pool, operator timeout.
-    http_client: reqwest::Client,
+    /// Shared across every request: one connection pool per proxy category,
+    /// operator timeout. Keyed / keyless / grok clients are intentionally
+    /// distinct so each can route through its own proxy (or none).
+    clients: crate::providers::http::HttpClients,
     /// One process-wide cache so `get_sources` continuation survives requests.
     cache: Arc<Mutex<SourceCache>>,
     /// Operator defaults that seed every request's config: the server's own
@@ -196,8 +199,28 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     // operator-fixed, and deferring the error to per-request service
     // construction would leave a listener up that rejects every call.
     crate::service::validate_source_providers(&operator_cfg)?;
-    // Restricted client: rejects redirects to non-public IP-literal targets.
-    let http_client = crate::providers::http::build_restricted_client(operator_cfg.timeout);
+    // Restricted clients: reject redirects to non-public IP-literal targets.
+    // One per proxy category (keyed / keyless / grok), each honoring the
+    // operator's NOVA_PROXY_* settings. `{account}` placeholders in any of the
+    // three resolve per provider key.
+    let keyed_keys: &[(&'static str, Option<&str>)] = &[
+        ("tavily", operator_cfg.tavily_api_key.as_deref()),
+        ("exa", operator_cfg.exa_api_key.as_deref()),
+        ("tinyfish", operator_cfg.tinyfish_api_key.as_deref()),
+        ("firecrawl", operator_cfg.firecrawl_api_key.as_deref()),
+    ];
+    let grok_key = operator_cfg
+        .grok_api_key
+        .as_deref()
+        .or(operator_cfg.openai_compatible_api_key.as_deref());
+    let clients = crate::providers::http::HttpClients::build_restricted(
+        operator_cfg.timeout,
+        operator_cfg.proxy_key.as_deref(),
+        operator_cfg.proxy_keyless.as_deref(),
+        operator_cfg.proxy_grok.as_deref(),
+        keyed_keys,
+        grok_key,
+    );
     let cache = Arc::new(Mutex::new(SourceCache::new(operator_cfg.cache_size)));
     let allowed_origins = parse_allowed_origins(&base_env);
 
@@ -237,7 +260,7 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     let config_ui_enabled = env_is_true(&base_env, CONFIG_UI_ENV);
 
     let state = AppState {
-        http_client,
+        clients,
         cache,
         base_env: Arc::new(request_base),
         allowed_origins: Arc::new(allowed_origins),
@@ -387,7 +410,7 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
     //    required key -> 401 (fail-closed); OAuth -> 400.
     let config = request_config(&state.base_env, state.config_ui);
     let service =
-        match SearchService::for_request(state.http_client.clone(), state.cache.clone(), config) {
+        match SearchService::for_request(state.clients.clone(), state.cache.clone(), config) {
             Ok(service) => service,
             Err(err) => return for_request_error(id.clone(), err),
         };
@@ -613,7 +636,7 @@ async fn messages_post(State(state): State<AppState>, request: axum::extract::Re
     // Reuse the per-request config + service exactly as /mcp does (server keys).
     let config = request_config(&state.base_env, state.config_ui);
     let service =
-        match SearchService::for_request(state.http_client.clone(), state.cache.clone(), config) {
+        match SearchService::for_request(state.clients.clone(), state.cache.clone(), config) {
             Ok(service) => service,
             Err(error) => {
                 let status = match &error {

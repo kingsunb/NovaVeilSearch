@@ -109,6 +109,7 @@ The MCP **transport** decides how config reaches the server — same values, dif
 | Tavily / Firecrawl / Exa anonymous mode | `TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS` |
 | DuckDuckGo / Bing enable & flavor | `DUCKDUCKGO_ENABLED`, `DUCKDUCKGO_REGION`, `BING_ENABLED`, `BING_MARKET` |
 | GitHub token | `GITHUB_TOKEN` |
+| Outbound proxy | `NOVA_PROXY_KEY` / `NOVA_PROXY_KEYLESS` / `NOVA_PROXY_GROK` |
 
 The tables below use env-key names (they also drive `config.toml` / stdio). Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports; the keyless engines (DuckDuckGo / Bing) need no key at all.
 
@@ -205,6 +206,49 @@ Notes:
 These specialists need **no Tavily/Firecrawl key** — they hit the public GitHub,
 StackExchange, arXiv, and Wikipedia APIs directly. Tavily/Firecrawl are only used
 for the generic fallback path.
+
+### Outbound proxy (off by default)
+
+Route the providers' outbound traffic through a proxy — everything is **direct by
+default**. Each category can go through a different proxy (or none); SOCKS5 is
+supported (`socks` is compiled in).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NOVA_PROXY_KEY` | unset | Proxy for the **keyed** providers: Tavily / Exa / TinyFish / Firecrawl. |
+| `NOVA_PROXY_KEYLESS` | unset | Proxy for the **keyless** engines (DuckDuckGo / Bing) **plus** the specialist extractors and the generic fetch chain. |
+| `NOVA_PROXY_GROK` | unset | Proxy for the **Grok** engine. Unset = Grok connects directly. |
+
+Accepted schemes: `http://`, `https://`, `socks5://`, `socks5h://` (optionally
+`http://user:pass@host:port`). Empty / unset = direct connection. An unparsable
+URL logs a warning and falls back to direct rather than failing startup.
+
+Any of the three may name an `{account}` placeholder in the **username** to give
+each provider its own sub-account on a shared proxy (parity with NovaVeil). The
+placeholder is replaced with a deterministic, non-reversible 8-hex alias derived
+from that provider's key — `sha256("provider:key")`'s first 8 hex chars — so the
+proxy vendor can track one key without ever seeing it:
+
+```toml
+[mcp_servers.nova-veil-search.env]
+NOVA_PROXY_KEY = "socks5h://Default.{account}:123@resin:2260"
+```
+
+The password and the rest of the URL are preserved verbatim; only the username's
+`{account}` is substituted. Each keyed provider (Tavily / Exa / TinyFish /
+Firecrawl) resolves its own alias from its own key, and Grok resolves `{account}`
+from its own key, so they share one template but land on distinct proxy accounts.
+A provider with no key (keyless mode) has no account to bind, so it logs a
+warning and connects directly. A fixed URL with no placeholder behaves exactly
+as before (all matching providers share it).
+
+```toml
+[mcp_servers.nova-veil-search.env]
+# Keyed providers through one proxy, keyless through another, Grok direct.
+NOVA_PROXY_KEY = "socks5://proxy-a:1080"
+NOVA_PROXY_KEYLESS = "socks5://proxy-b:1081"
+# NOVA_PROXY_GROK = "socks5://proxy-c:1082"   # leave unset → Grok direct
+```
 
 ### Selection rules at startup
 

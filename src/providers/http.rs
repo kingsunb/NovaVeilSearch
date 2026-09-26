@@ -1,23 +1,280 @@
-use reqwest::{Client, Response};
+use reqwest::{Client, Proxy, Response};
 use serde_json::Value;
 use std::time::Duration;
 
 use crate::error::{NovaVeilSearchError, Result};
 
-/// Build a tuned `reqwest::Client`. The same client is shared across providers
-/// so TLS sessions and keep-alive connections can be reused between providers
-/// that hit different hosts. Falls back to a bare `Client::new()` if the
-/// builder errors (preserves prior behavior for tests that construct providers
-/// without env-driven config).
-pub fn build_client(timeout: Duration) -> Client {
-    Client::builder()
+/// Parse a proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`,
+/// optionally with embedded credentials) into a reqwest [`Proxy`] that applies
+/// to every protocol. `None` when the value is empty/whitespace. An unparsable
+/// URL — or one with an unsupported scheme — logs a warning and degrades to
+/// `None` (direct) rather than failing the whole process: proxy config is an
+/// operator hint, and a typo there should not take a working search setup
+/// offline.
+pub fn proxy_from_url(url: &str) -> Option<Proxy> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match reqwest::Url::parse(trimmed) {
+        Ok(parsed) => match parsed.scheme() {
+            "http" | "https" | "socks5" | "socks5h" => match Proxy::all(parsed) {
+                Ok(proxy) => Some(proxy),
+                Err(err) => {
+                    eprintln!(
+                        "nova-veil-search: could not apply proxy \"{trimmed}\": {err}; connecting directly"
+                    );
+                    None
+                }
+            },
+            other => {
+                eprintln!(
+                    "nova-veil-search: unsupported proxy scheme \"{other}\" in \"{trimmed}\" (expected http, https, socks5, socks5h); connecting directly"
+                );
+                None
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "nova-veil-search: ignoring invalid proxy URL ({}): {}",
+                trimmed, err
+            );
+            None
+        }
+    }
+}
+
+/// Placeholder inside a proxy template's username that is replaced with a
+/// per-key derived account alias (parity with NovaVeil's `{account}` contract).
+pub const PROXY_ACCOUNT_PLACEHOLDER: &str = "{account}";
+
+/// Deterministic, non-reversible 8-hex alias identifying one provider's key,
+/// mirroring NovaVeil's `AccountAliasFor`: `sha256("{provider}:{key}")`
+/// truncated to 8 hex chars. Stable across requests and restarts (so a proxy
+/// vendor can track one key), distinct for every (provider, key) pair, and
+/// revealing nothing about the key itself.
+pub fn account_alias(provider: &str, key: &str) -> String {
+    let material = format!("{provider}:{key}");
+    let digest = ring::digest::digest(&ring::digest::SHA256, material.as_bytes());
+    let mut alias = String::with_capacity(8);
+    for byte in digest.as_ref().iter().take(4) {
+        alias.push_str(&format!("{byte:02x}"));
+    }
+    alias
+}
+
+/// Resolve the `{account}` placeholder in a proxy template's username only,
+/// following NovaVeil's contract: the password and the rest of the URL are
+/// preserved, and the URL is rebuilt through `reqwest::Url`'s userinfo API
+/// (never string concatenation) so special characters in the alias are escaped
+/// safely. Returns `Some(template)` unchanged when the template has no
+/// placeholder or no userinfo; `None` when the template is empty or unparsable.
+pub fn resolve_proxy_template(template: &str, account: &str) -> Option<String> {
+    let trimmed = template.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // The literal `{`/`}` would not survive `Url::parse` userinfo validation, so
+    // pre-escape the placeholder (parity with NovaVeil's Go implementation).
+    let prepared = trimmed.replace(PROXY_ACCOUNT_PLACEHOLDER, "%7Baccount%7D");
+    let mut parsed = match reqwest::Url::parse(&prepared) {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!(
+                "nova-veil-search: invalid proxy template ({}): {}",
+                trimmed, err
+            );
+            return None;
+        }
+    };
+    // `Url::username` returns the percent-encoded form; decode it before the
+    // substitution so any pre-existing encoded characters are preserved rather
+    // than double-encoded by `set_username` below.
+    let username = percent_encoding::percent_decode_str(parsed.username())
+        .decode_utf8_lossy()
+        .into_owned();
+    if !username.contains(PROXY_ACCOUNT_PLACEHOLDER) {
+        return Some(trimmed.to_string());
+    }
+    let username = username.replace(PROXY_ACCOUNT_PLACEHOLDER, account);
+    if parsed.set_username(&username).is_err() {
+        eprintln!(
+            "nova-veil-search: could not rewrite proxy template username; connecting directly"
+        );
+        return None;
+    }
+    Some(parsed.to_string())
+}
+
+/// Resolve the keyed proxy URL for one provider's key. When the template names
+/// `{account}`, substitute that provider's derived alias; otherwise the template
+/// is returned verbatim (a fixed proxy shared by every keyed provider). `None`
+/// means "connect directly": no template, an empty template, or an `{account}`
+/// template paired with an empty key (keyless mode has no account to bind to).
+pub fn resolve_keyed_proxy(
+    template: Option<&str>,
+    provider: &str,
+    key: Option<&str>,
+) -> Option<String> {
+    let template = template.map(str::trim).filter(|t| !t.is_empty())?;
+    if !template.contains(PROXY_ACCOUNT_PLACEHOLDER) {
+        return Some(template.to_string());
+    }
+    match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(key) => resolve_proxy_template(template, &account_alias(provider, key)),
+        None => {
+            eprintln!(
+                "nova-veil-search: proxy template contains {{account}} but {provider} has no key; connecting directly"
+            );
+            None
+        }
+    }
+}
+
+/// Build a tuned `reqwest::Client` with an optional outbound proxy. The same
+/// client is shared across providers so TLS sessions and keep-alive connections
+/// can be reused between providers that hit different hosts. Falls back to a
+/// bare `Client::new()` if the builder errors (preserves prior behavior for
+/// tests that construct providers without env-driven config).
+pub fn build_client_with_proxy(timeout: Duration, proxy: Option<&str>) -> Client {
+    let mut builder = Client::builder()
         .timeout(timeout)
         .gzip(true)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .tcp_keepalive(Some(Duration::from_secs(60)))
-        .tcp_nodelay(true)
-        .build()
-        .unwrap_or_else(|_| Client::new())
+        .tcp_nodelay(true);
+    if let Some(url) = proxy {
+        if let Some(p) = proxy_from_url(url) {
+            builder = builder.proxy(p);
+        }
+    }
+    builder.build().unwrap_or_else(|_| Client::new())
+}
+
+/// Build a tuned `reqwest::Client` with no proxy. See [`build_client_with_proxy`].
+pub fn build_client(timeout: Duration) -> Client {
+    build_client_with_proxy(timeout, None)
+}
+
+/// The outbound HTTP clients the search pipeline needs, differentiated by which
+/// upstream they serve so each category can route through its own proxy (or
+/// none):
+///
+/// * `keyed`   — the shared keyed-provider client (Tavily / Exa / TinyFish /
+///               Firecrawl). Carries a fixed `NOVA_PROXY_KEY` when that value is
+///               a plain URL; when it names `{account}`, per-provider clients
+///               live in the override map instead.
+/// * `keyless` — DuckDuckGo / Bing + specialist extractors + generic fetch
+///               (`NOVA_PROXY_KEYLESS`)
+/// * `grok`    — the Grok engine's own proxy (`NOVA_PROXY_GROK`); unset means
+///               direct, and it may name `{account}` like the keyed template
+#[derive(Clone)]
+pub struct HttpClients {
+    pub keyed: Client,
+    pub keyless: Client,
+    pub grok: Client,
+    /// Per-provider `{account}`-resolved clients, keyed by provider name. Only
+    /// populated when `NOVA_PROXY_KEY` names the placeholder; keyed providers
+    /// with an empty key (keyless mode) fall back to `keyed` (direct).
+    keyed_overrides: std::collections::HashMap<&'static str, Client>,
+}
+
+impl HttpClients {
+    /// Plain (non-restricted) clients for the stdio / local path.
+    pub fn build(
+        timeout: Duration,
+        proxy_key: Option<&str>,
+        proxy_keyless: Option<&str>,
+        proxy_grok: Option<&str>,
+        keyed_keys: &[(&'static str, Option<&str>)],
+        grok_key: Option<&str>,
+    ) -> Self {
+        Self::build_inner(
+            timeout,
+            proxy_key,
+            proxy_keyless,
+            proxy_grok,
+            keyed_keys,
+            grok_key,
+            false,
+        )
+    }
+
+    /// SSRF-restricted clients (redirects to non-public targets rejected) for
+    /// the public HTTP transport. Only compiled with the `http` feature.
+    #[cfg(feature = "http")]
+    pub fn build_restricted(
+        timeout: Duration,
+        proxy_key: Option<&str>,
+        proxy_keyless: Option<&str>,
+        proxy_grok: Option<&str>,
+        keyed_keys: &[(&'static str, Option<&str>)],
+        grok_key: Option<&str>,
+    ) -> Self {
+        Self::build_inner(
+            timeout,
+            proxy_key,
+            proxy_keyless,
+            proxy_grok,
+            keyed_keys,
+            grok_key,
+            true,
+        )
+    }
+
+    /// Client to route one keyed source provider through: its per-key resolved
+    /// client when the keyed template named `{account}`, else the shared keyed
+    /// client (fixed proxy or direct).
+    pub fn keyed_client(&self, provider: &'static str) -> &Client {
+        self.keyed_overrides.get(provider).unwrap_or(&self.keyed)
+    }
+
+    fn build_inner(
+        timeout: Duration,
+        proxy_key: Option<&str>,
+        proxy_keyless: Option<&str>,
+        proxy_grok: Option<&str>,
+        keyed_keys: &[(&'static str, Option<&str>)],
+        grok_key: Option<&str>,
+        restricted: bool,
+    ) -> Self {
+        // A template naming `{account}` cannot be applied verbatim to a shared
+        // client: every key resolves to its own proxy account. The shared
+        // `keyed` client therefore carries only a fixed (placeholder-free)
+        // proxy; the placeholder case produces per-provider overrides below.
+        let fixed_keyed: Option<String> = match proxy_key {
+            Some(t) if !t.trim().is_empty() && !t.contains(PROXY_ACCOUNT_PLACEHOLDER) => {
+                Some(t.trim().to_string())
+            }
+            _ => None,
+        };
+        let grok_proxy = resolve_keyed_proxy(proxy_grok, "grok", grok_key);
+
+        let mut keyed_overrides = std::collections::HashMap::new();
+        if proxy_key.map_or(false, |t| t.contains(PROXY_ACCOUNT_PLACEHOLDER)) {
+            for &(provider, key) in keyed_keys {
+                if let Some(resolved) = resolve_keyed_proxy(proxy_key, provider, key) {
+                    keyed_overrides.insert(provider, build_one(timeout, Some(&resolved), restricted));
+                }
+            }
+        }
+
+        Self {
+            keyed: build_one(timeout, fixed_keyed.as_deref(), restricted),
+            keyless: build_one(timeout, proxy_keyless, restricted),
+            grok: build_one(timeout, grok_proxy.as_deref(), restricted),
+            keyed_overrides,
+        }
+    }
+}
+
+fn build_one(timeout: Duration, proxy: Option<&str>, restricted: bool) -> Client {
+    #[cfg(feature = "http")]
+    if restricted {
+        return build_restricted_client_with_proxy(timeout, proxy);
+    }
+    let _ = restricted;
+    build_client_with_proxy(timeout, proxy)
 }
 
 /// True if `ip` is a globally-routable public address. Rejects loopback,
@@ -102,9 +359,19 @@ fn restricted_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
 /// depth. Used only by the public HTTP transport.
 #[cfg(feature = "http")]
 pub fn build_restricted_client(timeout: Duration) -> Client {
-    restricted_client_builder(timeout)
-        .build()
-        .unwrap_or_else(|_| Client::new())
+    build_restricted_client_with_proxy(timeout, None)
+}
+
+/// [`build_restricted_client`] with an optional outbound proxy.
+#[cfg(feature = "http")]
+pub fn build_restricted_client_with_proxy(timeout: Duration, proxy: Option<&str>) -> Client {
+    let mut builder = restricted_client_builder(timeout);
+    if let Some(url) = proxy {
+        if let Some(p) = proxy_from_url(url) {
+            builder = builder.proxy(p);
+        }
+    }
+    builder.build().unwrap_or_else(|_| Client::new())
 }
 
 /// Failure from [`post_json_with_status`]. `status` is the upstream HTTP
@@ -799,4 +1066,83 @@ fn finish_sse_json(
     last_json.ok_or_else(|| {
         NovaVeilSearchError::Parse(format!("{label} SSE stream ended without JSON data"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_alias_is_stable_8_hex_and_key_distinct() {
+        let a = account_alias("tavily", "sk-A");
+        assert_eq!(a.len(), 8);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // Stable for the same inputs…
+        assert_eq!(a, account_alias("tavily", "sk-A"));
+        // …but distinct per key and per provider.
+        assert_ne!(a, account_alias("tavily", "sk-B"));
+        assert_ne!(a, account_alias("exa", "sk-A"));
+        // Non-reversible: the raw key never appears.
+        assert!(!a.contains("sk-A"));
+    }
+
+    #[test]
+    fn resolve_proxy_template_username_only_password_untouched() {
+        // NovaVeil's contract: only the username's `{account}` is substituted;
+        // the password and the rest of the URL are preserved verbatim.
+        let resolved = resolve_proxy_template(
+            "socks5h://Default.{account}:123@resin:2260",
+            "a1b2c3d4",
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("socks5h://Default.a1b2c3d4:123@resin:2260")
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_template_no_placeholder_passthrough() {
+        let url = "socks5h://Default.fixed:123@resin:2260";
+        assert_eq!(
+            resolve_proxy_template(url, "unused").as_deref(),
+            Some(url)
+        );
+        // Without userinfo there is nothing to substitute.
+        assert_eq!(
+            resolve_proxy_template("socks5h://resin:2260", "unused").as_deref(),
+            Some("socks5h://resin:2260")
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_template_invalid_or_empty_is_none() {
+        assert_eq!(resolve_proxy_template("", "x"), None);
+        assert_eq!(resolve_proxy_template("  ", "x"), None);
+        assert_eq!(resolve_proxy_template("not a url", "x"), None);
+    }
+
+    #[test]
+    fn resolve_keyed_proxy_account_fixed_and_direct() {
+        // No template → direct.
+        assert_eq!(resolve_keyed_proxy(None, "tavily", Some("k")), None);
+
+        // Fixed (placeholder-free, trimmed) URL → shared proxy, key ignored.
+        assert_eq!(
+            resolve_keyed_proxy(Some(" socks5h://u:p@h:1080 "), "tavily", None),
+            Some("socks5h://u:p@h:1080".to_string())
+        );
+
+        // Placeholder + key → per-key alias in the username.
+        let template = "socks5h://Default.{account}:123@resin:2260";
+        let expected_alias = account_alias("tavily", "KEY");
+        assert_eq!(
+            resolve_keyed_proxy(Some(template), "tavily", Some("KEY")),
+            Some(format!("socks5h://Default.{expected_alias}:123@resin:2260"))
+        );
+
+        // Placeholder + no/empty key (keyless mode) → direct.
+        assert_eq!(resolve_keyed_proxy(Some(template), "exa", None), None);
+        assert_eq!(resolve_keyed_proxy(Some(template), "exa", Some("")), None);
+    }
 }
