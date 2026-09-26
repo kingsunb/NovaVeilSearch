@@ -1590,8 +1590,10 @@ impl SearchService {
                     "tavily",
                     self.config.tavily_api_key.as_deref(),
                 );
-                let client =
-                    crate::providers::http::build_client_with_proxy(self.config.timeout, proxy.as_deref());
+                let client = crate::providers::http::build_client_with_proxy(
+                    self.config.timeout,
+                    proxy.as_deref(),
+                );
                 instantiate_source(&TAVILY_SPEC, &self.config, &client)
             })
             .ok_or(NovaVeilSearchError::MissingConfig("TAVILY_API_KEY"))?;

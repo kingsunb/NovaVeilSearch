@@ -1378,10 +1378,7 @@ mod source_config_tests {
             ("NOVA_PROXY_GROK", "socks5://grok:1081"),
         ]);
         assert_eq!(set.proxy_key.as_deref(), Some("socks5://keyed:1080"));
-        assert_eq!(
-            set.proxy_keyless.as_deref(),
-            Some("http://keyless:8080")
-        );
+        assert_eq!(set.proxy_keyless.as_deref(), Some("http://keyless:8080"));
         assert_eq!(set.proxy_grok.as_deref(), Some("socks5://grok:1081"));
 
         // Blank proxy URLs read as absent (direct), mirroring blank-key handling.

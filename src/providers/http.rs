@@ -254,7 +254,8 @@ impl HttpClients {
         if proxy_key.map_or(false, |t| t.contains(PROXY_ACCOUNT_PLACEHOLDER)) {
             for &(provider, key) in keyed_keys {
                 if let Some(resolved) = resolve_keyed_proxy(proxy_key, provider, key) {
-                    keyed_overrides.insert(provider, build_one(timeout, Some(&resolved), restricted));
+                    keyed_overrides
+                        .insert(provider, build_one(timeout, Some(&resolved), restricted));
                 }
             }
         }
@@ -1091,10 +1092,8 @@ mod tests {
     fn resolve_proxy_template_username_only_password_untouched() {
         // NovaVeil's contract: only the username's `{account}` is substituted;
         // the password and the rest of the URL are preserved verbatim.
-        let resolved = resolve_proxy_template(
-            "socks5h://Default.{account}:123@resin:2260",
-            "a1b2c3d4",
-        );
+        let resolved =
+            resolve_proxy_template("socks5h://Default.{account}:123@resin:2260", "a1b2c3d4");
         assert_eq!(
             resolved.as_deref(),
             Some("socks5h://Default.a1b2c3d4:123@resin:2260")
@@ -1104,10 +1103,7 @@ mod tests {
     #[test]
     fn resolve_proxy_template_no_placeholder_passthrough() {
         let url = "socks5h://Default.fixed:123@resin:2260";
-        assert_eq!(
-            resolve_proxy_template(url, "unused").as_deref(),
-            Some(url)
-        );
+        assert_eq!(resolve_proxy_template(url, "unused").as_deref(), Some(url));
         // Without userinfo there is nothing to substitute.
         assert_eq!(
             resolve_proxy_template("socks5h://resin:2260", "unused").as_deref(),
