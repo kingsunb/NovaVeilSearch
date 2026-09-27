@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::error::{NovaVeilSearchError, Result};
+use crate::error::Result;
 
 pub mod arxiv;
 pub mod github;
@@ -163,9 +163,9 @@ pub async fn get_json(
     headers: &[(reqwest::header::HeaderName, &str)],
     label: &str,
 ) -> Result<serde_json::Value> {
-    let bytes = get_bytes(client, url, headers, label).await?;
-    serde_json::from_slice(&bytes)
-        .map_err(|err| NovaVeilSearchError::Parse(format!("invalid {label} JSON: {err}")))
+    crate::providers::http::send_json(get_request(client, url, headers), label)
+        .await
+        .map_err(|failure| failure.error)
 }
 
 /// Issue a `GET` and return the body as UTF-8 (lossy). Same error
@@ -187,29 +187,19 @@ async fn get_bytes(
     headers: &[(reqwest::header::HeaderName, &str)],
     label: &str,
 ) -> Result<Vec<u8>> {
+    crate::providers::http::send_bytes(get_request(client, url, headers), label).await
+}
+
+fn get_request(
+    client: &Client,
+    url: &str,
+    headers: &[(reqwest::header::HeaderName, &str)],
+) -> reqwest::RequestBuilder {
     let mut builder = client.get(url);
     for (name, value) in headers {
         builder = builder.header(name.clone(), *value);
     }
-    let response = builder.send().await.map_err(|err| {
-        if err.is_timeout() {
-            NovaVeilSearchError::Timeout(format!("{label} GET timed out: {err}"))
-        } else {
-            NovaVeilSearchError::Provider(format!("{label} GET failed: {err}"))
-        }
-    })?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| NovaVeilSearchError::Provider(format!("{label} body read failed: {err}")))?;
-    if !status.is_success() {
-        let text = String::from_utf8_lossy(&bytes);
-        return Err(NovaVeilSearchError::Provider(format!(
-            "{label} returned HTTP {status}: {text}"
-        )));
-    }
-    Ok(bytes.to_vec())
+    builder
 }
 
 #[cfg(test)]

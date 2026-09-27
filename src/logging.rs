@@ -7,6 +7,18 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{NovaVeilSearchError, Result};
 
+/// Nested transport errors may contain URLs even after reqwest::Error::without_url.
+/// Never copy userinfo, query strings, or token-bearing paths to stderr.
+pub(crate) fn redact_urls(text: &str) -> String {
+    static URLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    URLS.get_or_init(|| {
+        regex::Regex::new(r#"(?i)\b(?:https?|socks5h?)://[^\s<>\"']+"#)
+            .expect("static URL pattern")
+    })
+    .replace_all(text, "[redacted URL]")
+    .into_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugEvent {
     pub event: String,

@@ -236,12 +236,21 @@ NOVA_PROXY_KEY = "socks5h://Default.{account}:123@resin:2260"
 ```
 
 The password and the rest of the URL are preserved verbatim; only the username's
-`{account}` is substituted. Each keyed provider (Tavily / Exa / TinyFish /
-Firecrawl) resolves its own alias from its own key, and Grok resolves `{account}`
-from its own key, so they share one template but land on distinct proxy accounts.
-A provider with no key (keyless mode) has no account to bind, so it logs a
-warning and connects directly. A fixed URL with no placeholder behaves exactly
-as before (all matching providers share it).
+`{account}` is substituted. Every **key** gets its own alias derived from itself
+— `sha256("provider:key")`'s first 8 hex chars — so a comma-separated keyring
+(e.g. `TAVILY_API_KEY=tvly-a,tvly-b`) rotates through one proxy account **per
+key**, and each of Tavily / Exa / TinyFish / Firecrawl / Grok lands on its own
+accounts from one shared template. At startup one summary line names the proxy
+endpoint (credentials stripped) and each provider's first alias:
+
+```
+nova-veil-search: keyed proxy socks5h://resin:2260, per-key accounts: tavily=1a2b3c4d exa=…
+```
+
+A keyless engine has no key to bind an account to: an `{account}` in
+`NOVA_PROXY_KEYLESS` is refused with a startup note and the connection degrades
+to direct. A fixed URL with no placeholder behaves exactly as before (all
+matching providers share it).
 
 ```toml
 [mcp_servers.nova-veil-search.env]

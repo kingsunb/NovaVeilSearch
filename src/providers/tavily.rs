@@ -5,6 +5,7 @@ use crate::providers::http::{build_client, post_json_with_header_auth, post_json
 use crate::providers::keyring::{is_key_scoped_status, KeyRing};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,11 @@ use crate::error::NovaVeilSearchError;
 #[derive(Clone)]
 pub struct TavilyProvider {
     client: Client,
+    /// Per-key `{account}` proxy clients (exact key → client): the request
+    /// egresses through the proxy account derived from whichever key in the
+    /// ring signs it. Empty when no keyed proxy template names `{account}`;
+    /// every request then uses `client`.
+    per_key_clients: Arc<HashMap<String, Client>>,
     api_url: String,
     keys: Arc<KeyRing>,
     /// Keyless anonymous mode (`x-tavily-access-mode: keyless`), used when no
@@ -36,7 +42,7 @@ impl TavilyProvider {
         api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
-        Self::with_client_mode(client, api_url, api_key, false)
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, false)
     }
 
     /// [`with_client`] plus a keyless flag. When `keyless` is set and no key is
@@ -48,8 +54,22 @@ impl TavilyProvider {
         api_key: impl Into<String>,
         keyless: bool,
     ) -> Self {
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, keyless)
+    }
+
+    /// [`with_client_mode`] plus the per-key `{account}` proxy clients. Each
+    /// rotating request looks up the client for the exact key it signs with,
+    /// so one template lands every key on its own proxy account.
+    pub fn with_clients_mode(
+        client: Client,
+        per_key_clients: HashMap<String, Client>,
+        api_url: impl Into<String>,
+        api_key: impl Into<String>,
+        keyless: bool,
+    ) -> Self {
         Self {
             client,
+            per_key_clients: Arc::new(per_key_clients),
             api_url: api_url.into().trim_end_matches('/').to_string(),
             keys: Arc::new(KeyRing::parse(&api_key.into())),
             keyless,
@@ -90,7 +110,8 @@ impl TavilyProvider {
 
     /// POST with round-robin key selection. On a key-scoped failure
     /// (401/403/429/432/433) the request is retried once per remaining key;
-    /// any other failure — timeout, 5xx, parse — returns immediately.
+    /// Network retries happen within the shared HTTP helper using the same key;
+    /// other failures (5xx, parse) return without rotating keys.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
         if self.keyless && !self.keys.has_any_key() {
@@ -108,7 +129,10 @@ impl TavilyProvider {
         let mut last_error = None;
         for offset in 0..attempts {
             let key = self.keys.key(start + offset);
-            match post_json_with_status(&self.client, &endpoint, key, body, "Tavily").await {
+            // The proxy account is bound to the signing key: a rotated request
+            // egresses through its own key's `{account}` client when one exists.
+            let client = self.per_key_clients.get(key).unwrap_or(&self.client);
+            match post_json_with_status(client, &endpoint, key, body, "Tavily").await {
                 Ok(value) => return Ok(value),
                 Err(failure) => {
                     let key_scoped = failure.status.is_some_and(is_key_scoped_status);

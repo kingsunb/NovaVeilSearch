@@ -1,5 +1,6 @@
 use reqwest::{Client, Proxy, Response};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::{NovaVeilSearchError, Result};
@@ -22,22 +23,22 @@ pub fn proxy_from_url(url: &str) -> Option<Proxy> {
                 Ok(proxy) => Some(proxy),
                 Err(err) => {
                     eprintln!(
-                        "nova-veil-search: could not apply proxy \"{trimmed}\": {err}; connecting directly"
+                        "nova-veil-search: could not apply proxy: {}; connecting directly",
+                        err.without_url()
                     );
                     None
                 }
             },
             other => {
                 eprintln!(
-                    "nova-veil-search: unsupported proxy scheme \"{other}\" in \"{trimmed}\" (expected http, https, socks5, socks5h); connecting directly"
+                    "nova-veil-search: unsupported proxy scheme \"{other}\" (expected http, https, socks5, socks5h); connecting directly"
                 );
                 None
             }
         },
         Err(err) => {
             eprintln!(
-                "nova-veil-search: ignoring invalid proxy URL ({}): {}",
-                trimmed, err
+                "nova-veil-search: ignoring invalid proxy URL: {err}; connecting directly"
             );
             None
         }
@@ -47,6 +48,16 @@ pub fn proxy_from_url(url: &str) -> Option<Proxy> {
 /// Placeholder inside a proxy template's username that is replaced with a
 /// per-key derived account alias (parity with NovaVeil's `{account}` contract).
 pub const PROXY_ACCOUNT_PLACEHOLDER: &str = "{account}";
+
+/// Look only in the decoded username. Encoded placeholders are equivalent to
+/// literal ones; a placeholder in the password must not trigger account routing.
+fn has_account_placeholder(template: &str) -> bool {
+    reqwest::Url::parse(template.trim()).is_ok_and(|url| {
+        percent_encoding::percent_decode_str(url.username())
+            .decode_utf8_lossy()
+            .contains(PROXY_ACCOUNT_PLACEHOLDER)
+    })
+}
 
 /// Deterministic, non-reversible 8-hex alias identifying one provider's key,
 /// mirroring NovaVeil's `AccountAliasFor`: `sha256("{provider}:{key}")`
@@ -74,29 +85,27 @@ pub fn resolve_proxy_template(template: &str, account: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    // The literal `{`/`}` would not survive `Url::parse` userinfo validation, so
-    // pre-escape the placeholder (parity with NovaVeil's Go implementation).
-    let prepared = trimmed.replace(PROXY_ACCOUNT_PLACEHOLDER, "%7Baccount%7D");
-    let mut parsed = match reqwest::Url::parse(&prepared) {
+    let mut parsed = match reqwest::Url::parse(trimmed) {
         Ok(url) => url,
         Err(err) => {
             eprintln!(
-                "nova-veil-search: invalid proxy template ({}): {}",
-                trimmed, err
+                "nova-veil-search: invalid proxy template: {err}; connecting directly"
             );
             return None;
         }
     };
-    // `Url::username` returns the percent-encoded form; decode it before the
-    // substitution so any pre-existing encoded characters are preserved rather
-    // than double-encoded by `set_username` below.
+    // Decode exactly once for substitution. Url::set_username escapes reserved
+    // characters but preserves '%', so escape literal percent signs ourselves
+    // to avoid turning e.g. "%2540" into "@" in the SOCKS authentication bytes.
     let username = percent_encoding::percent_decode_str(parsed.username())
         .decode_utf8_lossy()
         .into_owned();
     if !username.contains(PROXY_ACCOUNT_PLACEHOLDER) {
         return Some(trimmed.to_string());
     }
-    let username = username.replace(PROXY_ACCOUNT_PLACEHOLDER, account);
+    let username = username
+        .replace(PROXY_ACCOUNT_PLACEHOLDER, account)
+        .replace('%', "%25");
     if parsed.set_username(&username).is_err() {
         eprintln!(
             "nova-veil-search: could not rewrite proxy template username; connecting directly"
@@ -117,18 +126,34 @@ pub fn resolve_keyed_proxy(
     key: Option<&str>,
 ) -> Option<String> {
     let template = template.map(str::trim).filter(|t| !t.is_empty())?;
-    if !template.contains(PROXY_ACCOUNT_PLACEHOLDER) {
+    if !has_account_placeholder(template) {
         return Some(template.to_string());
     }
-    match key.map(str::trim).filter(|k| !k.is_empty()) {
-        Some(key) => resolve_proxy_template(template, &account_alias(provider, key)),
-        None => {
-            eprintln!(
-                "nova-veil-search: proxy template contains {{account}} but {provider} has no key; connecting directly"
-            );
-            None
-        }
-    }
+    let key = key.map(str::trim).filter(|k| !k.is_empty())?;
+    resolve_proxy_template(template, &account_alias(provider, key))
+}
+
+/// Split a comma-separated key list the same way `KeyRing::parse` does: trim
+/// each segment, drop empties. A keyring of `"k1, k2"` therefore produces two
+/// proxy accounts, one per key.
+fn split_keys(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `scheme://host:port` of a proxy URL with userinfo and path stripped, so the
+/// startup summary can name the proxy without ever printing credentials.
+fn redacted_proxy_endpoint(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port_or_known_default() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
 }
 
 /// Build a tuned `reqwest::Client` with an optional outbound proxy. The same
@@ -162,7 +187,7 @@ pub fn build_client(timeout: Duration) -> Client {
 ///
 /// * `keyed`   — the shared keyed-provider client (Tavily / Exa / TinyFish /
 ///   Firecrawl). Carries a fixed `NOVA_PROXY_KEY` when that value is
-///   a plain URL; when it names `{account}`, per-provider clients
+///   a plain URL; when it names `{account}`, per-key clients
 ///   live in the override map instead.
 /// * `keyless` — DuckDuckGo / Bing + specialist extractors + generic fetch
 ///   (`NOVA_PROXY_KEYLESS`)
@@ -173,10 +198,13 @@ pub struct HttpClients {
     pub keyed: Client,
     pub keyless: Client,
     pub grok: Client,
-    /// Per-provider `{account}`-resolved clients, keyed by provider name. Only
-    /// populated when `NOVA_PROXY_KEY` names the placeholder; keyed providers
-    /// with an empty key (keyless mode) fall back to `keyed` (direct).
-    keyed_overrides: std::collections::HashMap<&'static str, Client>,
+    /// Per-key `{account}`-resolved clients, keyed by (provider, exact key).
+    /// One entry per key of a provider's comma-separated key list, so a
+    /// rotating provider (Tavily's `KeyRing`) can egress through the proxy
+    /// account derived from whichever key signed the request. Only populated
+    /// when `NOVA_PROXY_KEY` names the placeholder; keyed providers with an
+    /// empty key list (keyless mode) fall back to `keyed` (direct).
+    keyed_overrides: std::collections::HashMap<(&'static str, String), Client>,
 }
 
 impl HttpClients {
@@ -222,11 +250,30 @@ impl HttpClients {
         )
     }
 
-    /// Client to route one keyed source provider through: its per-key resolved
-    /// client when the keyed template named `{account}`, else the shared keyed
-    /// client (fixed proxy or direct).
-    pub fn keyed_client(&self, provider: &'static str) -> &Client {
-        self.keyed_overrides.get(provider).unwrap_or(&self.keyed)
+    /// Client for a keyed-provider request that will be signed with `key`: the
+    /// per-key `{account}` client when one was built for this (provider, key),
+    /// else the shared keyed client (fixed proxy or direct). Non-rotating
+    /// providers pass their raw config value through, which may still be a
+    /// comma list (only Tavily rotates) — the account then binds to the list's
+    /// first key, the same alias `build_inner` derived for it.
+    pub fn keyed_client_for(&self, provider: &'static str, key: Option<&str>) -> &Client {
+        let key = key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .and_then(|key| key.split(',').map(str::trim).find(|segment| !segment.is_empty()))
+            .and_then(|first| self.keyed_overrides.get(&(provider, first.to_string())));
+        key.unwrap_or(&self.keyed)
+    }
+
+    /// Every per-key client built for one provider (exact key → client). For
+    /// providers that rotate through several keys (Tavily): the request must
+    /// egress through the proxy account of whichever key signs it.
+    pub fn keyed_provider_clients(&self, provider: &'static str) -> HashMap<String, Client> {
+        self.keyed_overrides
+            .iter()
+            .filter(|((entry_provider, _), _)| *entry_provider == provider)
+            .map(|((_, key), client)| (key.clone(), client.clone()))
+            .collect()
     }
 
     fn build_inner(
@@ -241,30 +288,140 @@ impl HttpClients {
         // A template naming `{account}` cannot be applied verbatim to a shared
         // client: every key resolves to its own proxy account. The shared
         // `keyed` client therefore carries only a fixed (placeholder-free)
-        // proxy; the placeholder case produces per-provider overrides below.
+        // proxy; the placeholder case produces per-key overrides below.
+        let placeholder_key = proxy_key.is_some_and(|t| has_account_placeholder(t));
         let fixed_keyed: Option<String> = match proxy_key {
-            Some(t) if !t.trim().is_empty() && !t.contains(PROXY_ACCOUNT_PLACEHOLDER) => {
+            Some(t) if !t.trim().is_empty() && !has_account_placeholder(t) => {
                 Some(t.trim().to_string())
             }
             _ => None,
         };
+        // Keyless engines have no key, so an `{account}` in the keyless
+        // template could never be substituted — applying it verbatim would
+        // send the literal `{account}` as the proxy username. Degrade to
+        // direct with one startup note instead.
+        let keyless_proxy: Option<&str> = match proxy_keyless {
+            Some(t) if has_account_placeholder(t) => {
+                eprintln!(
+                    "nova-veil-search: keyless proxy names {{account}} but keyless engines have no key to bind an account to; connecting directly"
+                );
+                None
+            }
+            other => other,
+        };
         let grok_proxy = resolve_keyed_proxy(proxy_grok, "grok", grok_key);
 
         let mut keyed_overrides = std::collections::HashMap::new();
-        if proxy_key.is_some_and(|t| t.contains(PROXY_ACCOUNT_PLACEHOLDER)) {
-            for &(provider, key) in keyed_keys {
-                if let Some(resolved) = resolve_keyed_proxy(proxy_key, provider, key) {
-                    keyed_overrides
-                        .insert(provider, build_one(timeout, Some(&resolved), restricted));
+        if placeholder_key {
+            for &(provider, keys) in keyed_keys {
+                for key in split_keys(keys) {
+                    let resolved =
+                        resolve_proxy_template(proxy_key.unwrap_or_default(), &account_alias(provider, &key));
+                    if let Some(resolved) = resolved {
+                        keyed_overrides
+                            .insert((provider, key), build_one(timeout, Some(&resolved), restricted));
+                    }
                 }
             }
         }
+        proxy_startup_summary(
+            proxy_key,
+            placeholder_key,
+            keyed_keys,
+            &grok_proxy,
+            proxy_grok,
+            grok_key,
+            keyless_proxy,
+        );
 
         Self {
             keyed: build_one(timeout, fixed_keyed.as_deref(), restricted),
-            keyless: build_one(timeout, proxy_keyless, restricted),
+            keyless: build_one(timeout, keyless_proxy, restricted),
             grok: build_one(timeout, grok_proxy.as_deref(), restricted),
             keyed_overrides,
+        }
+    }
+}
+
+/// One stderr line per configured proxy category, so `docker logs` states the
+/// actual routing (endpoint without credentials, per-key account aliases —
+/// non-reversible 8-hex digests, safe to print) exactly once at startup.
+/// Successes and per-request activity stay silent; only failures log later.
+fn proxy_startup_summary(
+    proxy_key: Option<&str>,
+    placeholder_key: bool,
+    keyed_keys: &[(&'static str, Option<&str>)],
+    grok_proxy: &Option<String>,
+    proxy_grok: Option<&str>,
+    grok_key: Option<&str>,
+    keyless_proxy: Option<&str>,
+) {
+    if let Some(template) = proxy_key.map(str::trim).filter(|t| !t.is_empty()) {
+        // A placeholder template parses by construction; a fixed template that
+        // does not parse is reported by `proxy_from_url` at client-build time.
+        if let Some(endpoint) = redacted_proxy_endpoint(template) {
+            if placeholder_key {
+                let mut accounts = Vec::new();
+                for &(provider, keys) in keyed_keys {
+                    let keys = split_keys(keys);
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let alias = account_alias(provider, &keys[0]);
+                    let account = if keys.len() > 1 {
+                        format!("{provider}={alias}+{}", keys.len() - 1)
+                    } else {
+                        format!("{provider}={alias}")
+                    };
+                    accounts.push(account);
+                }
+                if accounts.is_empty() {
+                    eprintln!(
+                        "nova-veil-search: keyed proxy {endpoint} names {{account}} but no provider key is configured; keyed providers connect directly"
+                    );
+                } else {
+                    eprintln!(
+                        "nova-veil-search: keyed proxy {endpoint}, per-key accounts: {}",
+                        accounts.join(" ")
+                    );
+                }
+            } else {
+                eprintln!("nova-veil-search: keyed providers route through proxy {endpoint}");
+            }
+        }
+    }
+    if let Some(template) = proxy_keyless.map(str::trim).filter(|t| !t.is_empty()) {
+        // An unparsable URL is already reported when the client builds it;
+        // the summary only states healthy routing.
+        if let Some(endpoint) = redacted_proxy_endpoint(template) {
+            eprintln!("nova-veil-search: keyless engines route through proxy {endpoint}");
+        }
+    }
+    if let Some(template) = proxy_grok.map(str::trim).filter(|t| !t.is_empty()) {
+        let placeholder_grok = has_account_placeholder(template);
+        match grok_proxy {
+            Some(_) => {
+                if let Some(endpoint) = redacted_proxy_endpoint(template) {
+                    if placeholder_grok {
+                        let alias = grok_key
+                            .map(str::trim)
+                            .filter(|key| !key.is_empty())
+                            .map(|key| account_alias("grok", key))
+                            .unwrap_or_default();
+                        eprintln!("nova-veil-search: grok proxy {endpoint}, account {alias}");
+                    } else {
+                        eprintln!("nova-veil-search: grok routes through proxy {endpoint}");
+                    }
+                }
+            }
+            None if placeholder_grok => {
+                eprintln!(
+                    "nova-veil-search: grok proxy template names {{account}} but no Grok key is configured; Grok connects directly"
+                );
+            }
+            // None without a placeholder: an unparsable URL, already reported
+            // when the grok client was built.
+            None => {}
         }
     }
 }
@@ -394,6 +551,136 @@ impl HttpFailure {
     }
 }
 
+/// Three retries after the initial attempt. HTTP status and response-format
+/// errors are not network failures and do not consume this retry budget.
+const NETWORK_RETRIES: usize = 3;
+
+enum AttemptFailure {
+    Network(reqwest::Error, &'static str),
+    Response(HttpFailure),
+}
+
+impl From<NovaVeilSearchError> for AttemptFailure {
+    fn from(error: NovaVeilSearchError) -> Self {
+        Self::Response(HttpFailure::transport(error))
+    }
+}
+
+/// Include the underlying DNS/TLS/SOCKS/IO cause, which reqwest's Display alone
+/// omits. Remove URLs so credentials and search query strings cannot enter logs.
+fn network_error_detail(error: reqwest::Error) -> String {
+    use std::error::Error;
+    let error = error.without_url();
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    crate::logging::redact_urls(&detail)
+}
+
+/// Retry the complete exchange, including response-body/SSE reads. A successful
+/// retry emits no log; exhausted network errors and other terminal failures emit
+/// one stderr line (visible in docker logs). All callers use replayable bodies.
+async fn send_with_retry<T, F, Fut>(
+    mut request: reqwest::RequestBuilder,
+    label: &str,
+    read_response: F,
+) -> std::result::Result<T, HttpFailure>
+where
+    F: Fn(Response) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, AttemptFailure>>,
+{
+    let target = request
+        .try_clone()
+        .and_then(|r| r.build().ok())
+        .map(|r| r.url().origin().ascii_serialization())
+        .unwrap_or_else(|| "invalid URL".to_string());
+    let mut attempt = 1;
+    loop {
+        let replay = request.try_clone();
+        let failure = match request.send().await {
+            Ok(response) => match read_response(response).await {
+                Ok(value) => return Ok(value),
+                Err(failure) => failure,
+            },
+            Err(error) => AttemptFailure::Network(error, "request"),
+        };
+        let (failure, detail) = match failure {
+            AttemptFailure::Network(error, stage) => {
+                let retryable = !error.is_builder() && !error.is_redirect() && !error.is_status();
+                if retryable && attempt <= NETWORK_RETRIES {
+                    if let Some(next) = replay {
+                        request = next;
+                        tokio::time::sleep(Duration::from_millis(250 << (attempt - 1))).await;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                let timed_out = error.is_timeout();
+                let detail = format!("{stage} failed: {}", network_error_detail(error));
+                let message = format!("{label} {detail} (after {attempt} attempts)");
+                let error = if timed_out {
+                    NovaVeilSearchError::Timeout(message)
+                } else {
+                    NovaVeilSearchError::Provider(message)
+                };
+                (HttpFailure::transport(error), detail)
+            }
+            AttemptFailure::Response(failure) => {
+                // Response bodies can echo tokens or request data. Keep those
+                // out of process logs; callers still receive the upstream error.
+                let detail = match failure.status {
+                    Some(status) => format!("upstream returned HTTP {status}"),
+                    None => match &failure.error {
+                        NovaVeilSearchError::Parse(_) => "invalid upstream response".to_string(),
+                        _ => "upstream response rejected".to_string(),
+                    },
+                };
+                (failure, detail)
+            }
+        };
+        eprintln!(
+            "nova-veil-search: ERROR provider={label:?} target={target:?} attempts={attempt} retries={} error={detail:?}",
+            attempt - 1
+        );
+        return Err(failure);
+    }
+}
+
+async fn read_response_bytes(
+    response: Response,
+    label: &str,
+) -> std::result::Result<Vec<u8>, AttemptFailure> {
+    let status = response.status();
+    if !status.is_success() {
+        let bytes = response.bytes().await.unwrap_or_default();
+        let text = truncate_for_error(&String::from_utf8_lossy(&bytes));
+        return Err(AttemptFailure::Response(HttpFailure {
+            status: Some(status.as_u16()),
+            error: NovaVeilSearchError::Provider(format!("{label} returned HTTP {status}: {text}")),
+        }));
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| AttemptFailure::Network(error, "body read"))
+}
+
+/// Shared by specialist fetchers and raw/SSE text endpoints as well as JSON
+/// providers, so all provider traffic has the same network retry policy.
+pub(crate) async fn send_bytes(
+    request: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<Vec<u8>> {
+    send_with_retry(request, label, |response| read_response_bytes(response, label))
+        .await
+        .map_err(|failure| failure.error)
+}
+
 /// Issue an authenticated JSON POST and normalize transport / status / parse
 /// errors into `NovaVeilSearchError`. `label` appears in error messages to
 /// distinguish upstream providers (e.g. "Tavily", "Firecrawl", "Grok Responses").
@@ -489,42 +776,26 @@ pub async fn get_html(
     query: &[(&str, String)],
     label: &str,
 ) -> Result<String> {
-    let response = client
+    let request = client
         .get(endpoint)
         .query(query)
         .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
         .header(
             reqwest::header::ACCEPT_LANGUAGE,
             "en-US,en;q=0.9,zh-CN;q=0.8",
-        )
-        .send()
-        .await
-        .map_err(|err| {
-            if err.is_timeout() {
-                NovaVeilSearchError::Timeout(format!("{label} request timed out: {err}"))
-            } else {
-                NovaVeilSearchError::Provider(format!("{label} request failed: {err}"))
-            }
-        })?;
-
-    let status = response.status();
-    let html = response
-        .text()
-        .await
-        .map_err(|err| NovaVeilSearchError::Provider(format!("{label} body read failed: {err}")))?;
-
-    if !status.is_success() {
-        return Err(NovaVeilSearchError::Provider(format!(
-            "{label} returned HTTP {status}: {}",
-            truncate_for_error(&html)
-        )));
-    }
-    if is_anti_bot_challenge(&html) {
-        return Err(NovaVeilSearchError::Provider(format!(
-            "{label} is rate-limited (anti-bot challenge; usually temporary)"
-        )));
-    }
-    Ok(html)
+        );
+    send_with_retry(request, label, |response| async move {
+        let bytes = read_response_bytes(response, label).await?;
+        let html = String::from_utf8_lossy(&bytes).into_owned();
+        if is_anti_bot_challenge(&html) {
+            return Err(NovaVeilSearchError::Provider(format!(
+                "{label} is rate-limited (anti-bot challenge; usually temporary)"
+            )).into());
+        }
+        Ok(html)
+    })
+    .await
+    .map_err(|failure| failure.error)
 }
 
 /// POST a JSON-RPC body with arbitrary headers (no auth) and return the raw
@@ -541,25 +812,8 @@ pub async fn post_raw_json(
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    let response = request.json(body).send().await.map_err(|err| {
-        if err.is_timeout() {
-            NovaVeilSearchError::Timeout(format!("{label} request timed out: {err}"))
-        } else {
-            NovaVeilSearchError::Provider(format!("{label} request failed: {err}"))
-        }
-    })?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|err| NovaVeilSearchError::Provider(format!("{label} body read failed: {err}")))?;
-    if !status.is_success() {
-        return Err(NovaVeilSearchError::Provider(format!(
-            "{label} returned HTTP {status}: {}",
-            truncate_for_error(&text)
-        )));
-    }
-    Ok(text)
+    let bytes = send_bytes(request.json(body), label).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Cap an error-body excerpt so a hostile/inflated upstream can't bloat notes.
@@ -668,19 +922,17 @@ pub(crate) fn squash_whitespace(input: &str) -> String {
 /// Send a prepared JSON request and normalize transport / status / parse
 /// failures into `HttpFailure`. Shared by the bearer- and header-auth helpers
 /// so every provider gets identical error handling (including the SSE path).
-async fn send_json(
+pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
     label: &str,
 ) -> std::result::Result<Value, HttpFailure> {
-    let mut response = request.send().await.map_err(|err| {
-        HttpFailure::transport(if err.is_timeout() {
-            NovaVeilSearchError::Timeout(format!("{label} request timed out: {err}"))
-        } else {
-            NovaVeilSearchError::Provider(format!("{label} request failed: {err}"))
-        })
-    })?;
+    send_with_retry(request, label, |response| read_json_response(response, label)).await
+}
 
-    let status = response.status();
+async fn read_json_response(
+    mut response: Response,
+    label: &str,
+) -> std::result::Result<Value, AttemptFailure> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -688,43 +940,29 @@ async fn send_json(
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if status.is_success() && content_type.starts_with("text/event-stream") {
-        return read_sse_json(&mut response, label)
-            .await
-            .map_err(HttpFailure::transport);
+    if response.status().is_success() && content_type.starts_with("text/event-stream") {
+        return read_sse_json(&mut response, label).await;
     }
 
-    let bytes = response.bytes().await.map_err(|err| {
-        HttpFailure::transport(NovaVeilSearchError::Provider(format!(
-            "{label} body read failed: {err}"
-        )))
-    })?;
-
-    if !status.is_success() {
-        let text = String::from_utf8_lossy(&bytes);
-        return Err(HttpFailure {
-            status: Some(status.as_u16()),
-            error: NovaVeilSearchError::Provider(format!("{label} returned HTTP {status}: {text}")),
-        });
-    }
+    let bytes = read_response_bytes(response, label).await?;
 
     serde_json::from_slice(&bytes).map_err(|err| {
-        HttpFailure::transport(NovaVeilSearchError::Parse(format!(
-            "invalid {label} JSON: {err}"
-        )))
+        NovaVeilSearchError::Parse(format!("invalid {label} JSON: {err}")).into()
     })
 }
 
-async fn read_sse_json(response: &mut Response, label: &str) -> Result<Value> {
+async fn read_sse_json(
+    response: &mut Response,
+    label: &str,
+) -> std::result::Result<Value, AttemptFailure> {
     let mut buffer = Vec::new();
     let mut output_text = String::new();
     let mut chat_content = String::new();
     let mut last_json = None;
     let mut chat_metadata = None;
 
-    while let Some(chunk) = response.chunk().await.map_err(|err| {
-        NovaVeilSearchError::Provider(format!("{label} stream read failed: {err}"))
-    })? {
+    while let Some(chunk) = response.chunk().await
+        .map_err(|err| AttemptFailure::Network(err, "stream read"))? {
         buffer.extend_from_slice(&chunk);
 
         while let Some((event, rest)) = split_sse_event(&buffer) {
@@ -758,6 +996,7 @@ async fn read_sse_json(response: &mut Response, label: &str) -> Result<Value> {
     }
 
     finish_sse_json(label, last_json, chat_metadata, output_text, chat_content)
+        .map_err(AttemptFailure::from)
 }
 
 struct SseEvent {
@@ -1112,6 +1351,36 @@ mod tests {
     }
 
     #[test]
+    fn encoded_placeholder_is_resolved_only_in_the_username() {
+        for placeholder in ["{account}", "%7Baccount%7D", "%7baccount%7d"] {
+            let template = format!("socks5h://Default.{placeholder}:p%40ss@proxy:1080");
+            let alias = account_alias("tavily", "test-key");
+            assert_eq!(
+                resolve_keyed_proxy(Some(&template), "tavily", Some("test-key")),
+                Some(format!("socks5h://Default.{alias}:p%40ss@proxy:1080"))
+            );
+        }
+        let fixed = "socks5://fixed:%7Baccount%7D@proxy:1080";
+        assert_eq!(resolve_keyed_proxy(Some(fixed), "tavily", None).as_deref(), Some(fixed));
+    }
+
+    #[test]
+    fn template_preserves_literal_percent_and_escapes_alias() {
+        let resolved = resolve_proxy_template(
+            "socks5h://u%2540.{account}:p%2540%40ss@proxy:1080",
+            "a@b:c/d%40",
+        ).unwrap();
+        let parsed = reqwest::Url::parse(&resolved).unwrap();
+        assert_eq!(
+            percent_encoding::percent_decode_str(parsed.username()).decode_utf8_lossy(),
+            "u%40.a@b:c/d%40"
+        );
+        assert_eq!(parsed.password(), Some("p%2540%40ss"));
+        assert_eq!(parsed.host_str(), Some("proxy"));
+        assert_eq!(parsed.port(), Some(1080));
+    }
+
+    #[test]
     fn resolve_proxy_template_invalid_or_empty_is_none() {
         assert_eq!(resolve_proxy_template("", "x"), None);
         assert_eq!(resolve_proxy_template("  ", "x"), None);
@@ -1140,5 +1409,42 @@ mod tests {
         // Placeholder + no/empty key (keyless mode) → direct.
         assert_eq!(resolve_keyed_proxy(Some(template), "exa", None), None);
         assert_eq!(resolve_keyed_proxy(Some(template), "exa", Some("")), None);
+    }
+
+    #[test]
+    fn placeholder_template_builds_one_client_per_key() {
+        let template = "socks5h://Default.{account}:123@resin:2260";
+        let keys = [
+            ("tavily", Some("k1, k2 ,")),
+            ("exa", Some("e1")),
+            ("tinyfish", None),
+            ("firecrawl", Some("")),
+        ];
+        let clients = HttpClients::build(Duration::from_secs(5), Some(template), None, None, &keys, None);
+        // Tavily's two keys each get their own proxy-account client; empty
+        // key lists (tinyfish / firecrawl) get none and fall back to shared.
+        let tavily = clients.keyed_provider_clients("tavily");
+        assert_eq!(tavily.len(), 2);
+        assert!(tavily.contains_key("k1") && tavily.contains_key("k2"));
+        assert!(clients.keyed_provider_clients("exa").contains_key("e1"));
+        assert!(clients.keyed_provider_clients("tinyfish").is_empty());
+        assert!(clients.keyed_provider_clients("firecrawl").is_empty());
+        // (Whether the matched or shared client is returned for a given key
+        // is verified on the wire by tests/proxy_http.rs.)
+    }
+
+    #[test]
+    fn fixed_keyed_template_has_no_per_key_clients() {
+        let keys = [("tavily", Some("k1")), ("exa", None), ("tinyfish", None), ("firecrawl", None)];
+        let clients = HttpClients::build(
+            Duration::from_secs(5),
+            Some("socks5h://fixed:123@resin:2260"),
+            None,
+            None,
+            &keys,
+            None,
+        );
+        assert!(clients.keyed_provider_clients("tavily").is_empty());
+        assert!(std::ptr::eq(clients.keyed_client_for("tavily", Some("k1")), &clients.keyed));
     }
 }

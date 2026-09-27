@@ -193,8 +193,17 @@ impl SessionStore {
 /// supply none — and every request must authenticate with a bearer token.
 pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> anyhow::Result<()> {
     // Operator config (timeout, cache sizing, chain order) drives the shared
-    // client + cache.
-    let operator_cfg = Config::from_env_map(base_env.clone());
+    // client + cache. With the settings frontend enabled, the same full
+    // precedence chain the requests use (env > config.toml > defaults) applies
+    // here too: the shared clients' proxies and `{account}` overrides must be
+    // resolved against the keys the requests will actually run on, so keys or
+    // NOVA_PROXY_* living only in config.toml still produce per-key clients.
+    // (Runtime edits via PUT /api/config take effect on the next restart.)
+    let operator_cfg = if env_is_true(&base_env, CONFIG_UI_ENV) {
+        Config::load_from(base_env.clone())
+    } else {
+        Config::from_env_map(base_env.clone())
+    };
     // Fail before binding on a bad GROK_SEARCH_SOURCE_PROVIDERS: the chain is
     // operator-fixed, and deferring the error to per-request service
     // construction would leave a listener up that rejects every call.

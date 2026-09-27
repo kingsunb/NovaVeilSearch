@@ -279,22 +279,25 @@ Schemes: `http://`, `https://`, `socks5://`, `socks5h://`, optionally with
 `user:pass@` credentials. An unparsable URL logs a warning and degrades to direct.
 
 Any of the three accepts an `{account}` placeholder in the **username** to
-derive one proxy sub-account per provider (parity with NovaVeil). The
-placeholder is replaced with a deterministic 8-hex alias — `sha256("provider:key")`'s
-first 8 hex chars, non-reversible — so each keyed provider (Tavily / Exa /
-TinyFish / Firecrawl) lands on its own account from a single template, and Grok
-resolves `{account}` from its own key, and the proxy vendor can track a key
-without ever seeing it. Only the username is substituted; the password and the
-rest of the URL are preserved:
+derive one proxy sub-account per key (parity with NovaVeil). The placeholder is
+replaced with a deterministic 8-hex alias — `sha256("provider:key")`'s first 8
+hex chars, non-reversible — so every key of a comma-separated keyring gets its
+own account (Tavily's round-robin rotation egresses through the account of
+whichever key signed the request), and each of Tavily / Exa / TinyFish /
+Firecrawl / Grok lands on its own accounts from a single template; the proxy
+vendor can track a key without ever seeing it. Only the username is substituted;
+the password and the rest of the URL are preserved:
 
 ```toml
 proxy_key  = "socks5h://Default.{account}:123@resin:2260"
 proxy_grok = "socks5://grok-only:1080"   # Grok has its own URL; unset = direct
 ```
 
-A provider with no key (keyless mode) has nothing to bind an account to, so it
-logs a warning and connects directly. A fixed URL with no placeholder behaves
-exactly as before — all matching providers share it.
+At startup one summary line per configured category states the routing (endpoint
+without credentials, plus each provider's first alias). A keyless engine has no
+key to bind an account to: an `{account}` in `NOVA_PROXY_KEYLESS` is refused
+with a startup note and degrades to direct. A fixed URL with no placeholder
+behaves exactly as before — all matching providers share it.
 
 ## Config file
 

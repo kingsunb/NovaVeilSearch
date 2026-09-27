@@ -324,8 +324,11 @@ enum SourceSlot {
 fn instantiate_source(
     spec: &'static ProviderSpec,
     config: &Config,
-    http: &reqwest::Client,
+    clients: &crate::providers::http::HttpClients,
 ) -> Option<Arc<dyn SourceProvider>> {
+    // Keyless engines (DuckDuckGo/Bing, key_var == "") route through the
+    // keyless proxy; keyed providers route through the keyed proxy — via their
+    // own per-key `{account}` client when the keyed template names one.
     match spec.name {
         "tavily" => {
             if !config.tavily_enabled {
@@ -335,8 +338,9 @@ fn instantiate_source(
             if key.is_empty() && !config.tavily_keyless {
                 return None;
             }
-            Some(Arc::new(TavilyProvider::with_client_mode(
-                http.clone(),
+            Some(Arc::new(TavilyProvider::with_clients_mode(
+                clients.keyed.clone(),
+                clients.keyed_provider_clients("tavily"),
                 config.tavily_api_url.clone(),
                 key,
                 config.tavily_keyless,
@@ -351,7 +355,9 @@ fn instantiate_source(
                 return None;
             }
             Some(Arc::new(ExaProvider::with_client_mode(
-                http.clone(),
+                clients
+                    .keyed_client_for("exa", config.exa_api_key.as_deref())
+                    .clone(),
                 config.exa_api_url.clone(),
                 key,
                 config.exa_keyless,
@@ -363,7 +369,9 @@ fn instantiate_source(
             .flatten()
             .map(|key| {
                 Arc::new(TinyfishProvider::with_client(
-                    http.clone(),
+                    clients
+                        .keyed_client_for("tinyfish", config.tinyfish_api_key.as_deref())
+                        .clone(),
                     config.tinyfish_search_api_url.clone(),
                     config.tinyfish_fetch_api_url.clone(),
                     key,
@@ -378,7 +386,9 @@ fn instantiate_source(
                 return None;
             }
             Some(Arc::new(FirecrawlProvider::with_client_mode(
-                http.clone(),
+                clients
+                    .keyed_client_for("firecrawl", config.firecrawl_api_key.as_deref())
+                    .clone(),
                 config.firecrawl_api_url.clone(),
                 key,
                 config.firecrawl_keyless,
@@ -386,13 +396,13 @@ fn instantiate_source(
         }
         "duckduckgo" => config.duckduckgo_enabled.then(|| {
             Arc::new(DuckduckgoProvider::with_client(
-                http.clone(),
+                clients.keyless.clone(),
                 config.duckduckgo_region.clone(),
             )) as Arc<dyn SourceProvider>
         }),
         "bing" => config.bing_enabled.then(|| {
             Arc::new(BingProvider::with_client(
-                http.clone(),
+                clients.keyless.clone(),
                 config.bing_market.clone(),
             )) as Arc<dyn SourceProvider>
         }),
@@ -458,14 +468,7 @@ fn build_source_slots(
 
     let mut slots = Vec::new();
     for spec in specs {
-        // Keyless engines (DuckDuckGo/Bing, key_var == "") route through the
-        // keyless proxy; every keyed provider routes through the keyed proxy.
-        let client = if spec.key_var.is_empty() {
-            &clients.keyless
-        } else {
-            clients.keyed_client(spec.name)
-        };
-        match instantiate_source(spec, config, client) {
+        match instantiate_source(spec, config, clients) {
             Some(provider) => slots.push(SourceSlot::Active(SourceEntry { spec, provider })),
             None if spec.core || explicit => slots.push(SourceSlot::Missing {
                 spec,
@@ -1574,7 +1577,8 @@ impl SearchService {
         // capability, not part of the supplemental-source chain — an operator
         // whose GROK_SEARCH_SOURCE_PROVIDERS excludes Tavily from the chain
         // keeps map as long as TAVILY_API_KEY is configured, so a map-capable
-        // provider absent from the chain is instantiated directly.
+        // provider absent from the chain is instantiated directly (with the
+        // same per-key `{account}` proxy routing as the chain path).
         let provider = self
             .source_slots
             .iter()
@@ -1585,16 +1589,18 @@ impl SearchService {
                 _ => None,
             })
             .or_else(|| {
-                let proxy = crate::providers::http::resolve_keyed_proxy(
-                    self.config.proxy_key.as_deref(),
-                    "tavily",
-                    self.config.tavily_api_key.as_deref(),
-                );
-                let client = crate::providers::http::build_client_with_proxy(
-                    self.config.timeout,
-                    proxy.as_deref(),
-                );
-                instantiate_source(&TAVILY_SPEC, &self.config, &client)
+                let clients = proxy_clients(&self.config);
+                let key = self.config.tavily_api_key.clone().unwrap_or_default();
+                (self.config.tavily_enabled && (!key.is_empty() || self.config.tavily_keyless))
+                    .then(|| {
+                        Arc::new(TavilyProvider::with_clients_mode(
+                            clients.keyed.clone(),
+                            clients.keyed_provider_clients("tavily"),
+                            self.config.tavily_api_url.clone(),
+                            key,
+                            self.config.tavily_keyless,
+                        )) as Arc<dyn SourceProvider>
+                    })
             })
             .ok_or(NovaVeilSearchError::MissingConfig("TAVILY_API_KEY"))?;
         provider.map(url, max_results).await
