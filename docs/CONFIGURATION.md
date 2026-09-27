@@ -6,7 +6,7 @@ NovaVeilSearch reads configuration from two sources, merged with the following p
 2. **Global TOML config file** — `$GROK_SEARCH_CONFIG` if set, otherwise `<home>/.config/nova-veil-search/config.toml` on every platform. `<home>` is `$HOME` on Unix / Git Bash, `%USERPROFILE%` on native Windows shells (PowerShell, cmd).
 3. **Built-in defaults** (lowest).
 
-The config file is optional; missing files are skipped silently. See the [Config file](#config-file) section below for the TOML schema. The AI provider contract is intentionally narrow: configure a Grok/OpenAI-compatible root URL and the server calls `/v1/responses`.
+The config file is optional; missing files are skipped silently. See the [Config file](#config-file) section below for the TOML schema. The AI provider contract is intentionally narrow: configure a Grok/OpenAI-compatible root URL and the server calls `/v1/responses`. For the full list of search-source engines — including candidates evaluated but deliberately **not** integrated — see [Source Providers](./SOURCE_PROVIDERS.md).
 
 > **Configuring the remote HTTP transport?** There is one credential model — **server-held keys** — and authentication is mandatory. Set `GROK_MCP_API_TOKEN` (required) and put the provider keys in the server's own environment; every request authenticates with `Authorization: Bearer <token>` (the master token, or a short-lived session token from `POST /login`). Callers never supply their own keys. See [Configuration channels](#configuration-channels-stdio-env-vs-remote-env) directly below.
 

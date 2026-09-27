@@ -39,9 +39,7 @@ pub fn proxy_from_url(url: &str) -> Option<Proxy> {
             }
         },
         Err(err) => {
-            eprintln!(
-                "nova-veil-search: ignoring invalid proxy URL: {err}; connecting directly"
-            );
+            eprintln!("nova-veil-search: ignoring invalid proxy URL: {err}; connecting directly");
             None
         }
     }
@@ -90,9 +88,7 @@ pub fn resolve_proxy_template(template: &str, account: &str) -> Option<String> {
     let mut parsed = match reqwest::Url::parse(trimmed) {
         Ok(url) => url,
         Err(err) => {
-            eprintln!(
-                "nova-veil-search: invalid proxy template: {err}; connecting directly"
-            );
+            eprintln!("nova-veil-search: invalid proxy template: {err}; connecting directly");
             return None;
         }
     };
@@ -262,7 +258,11 @@ impl HttpClients {
         let key = key
             .map(str::trim)
             .filter(|key| !key.is_empty())
-            .and_then(|key| key.split(',').map(str::trim).find(|segment| !segment.is_empty()))
+            .and_then(|key| {
+                key.split(',')
+                    .map(str::trim)
+                    .find(|segment| !segment.is_empty())
+            })
             .and_then(|first| self.keyed_overrides.get(&(provider, first.to_string())));
         key.unwrap_or(&self.keyed)
     }
@@ -291,7 +291,7 @@ impl HttpClients {
         // client: every key resolves to its own proxy account. The shared
         // `keyed` client therefore carries only a fixed (placeholder-free)
         // proxy; the placeholder case produces per-key overrides below.
-        let placeholder_key = proxy_key.is_some_and(|t| has_account_placeholder(t));
+        let placeholder_key = proxy_key.is_some_and(has_account_placeholder);
         let fixed_keyed: Option<String> = match proxy_key {
             Some(t) if !t.trim().is_empty() && !has_account_placeholder(t) => {
                 Some(t.trim().to_string())
@@ -317,11 +317,15 @@ impl HttpClients {
         if placeholder_key {
             for &(provider, keys) in keyed_keys {
                 for key in split_keys(keys) {
-                    let resolved =
-                        resolve_proxy_template(proxy_key.unwrap_or_default(), &account_alias(provider, &key));
+                    let resolved = resolve_proxy_template(
+                        proxy_key.unwrap_or_default(),
+                        &account_alias(provider, &key),
+                    );
                     if let Some(resolved) = resolved {
-                        keyed_overrides
-                            .insert((provider, key), build_one(timeout, Some(&resolved), restricted));
+                        keyed_overrides.insert(
+                            (provider, key),
+                            build_one(timeout, Some(&resolved), restricted),
+                        );
                     }
                 }
             }
@@ -392,7 +396,7 @@ fn proxy_startup_summary(
             }
         }
     }
-    if let Some(template) = proxy_keyless.map(str::trim).filter(|t| !t.is_empty()) {
+    if let Some(template) = keyless_proxy.map(str::trim).filter(|t| !t.is_empty()) {
         // An unparsable URL is already reported when the client builds it;
         // the summary only states healthy routing.
         if let Some(endpoint) = redacted_proxy_endpoint(template) {
@@ -674,13 +678,12 @@ async fn read_response_bytes(
 
 /// Shared by specialist fetchers and raw/SSE text endpoints as well as JSON
 /// providers, so all provider traffic has the same network retry policy.
-pub(crate) async fn send_bytes(
-    request: reqwest::RequestBuilder,
-    label: &str,
-) -> Result<Vec<u8>> {
-    send_with_retry(request, label, |response| read_response_bytes(response, label))
-        .await
-        .map_err(|failure| failure.error)
+pub(crate) async fn send_bytes(request: reqwest::RequestBuilder, label: &str) -> Result<Vec<u8>> {
+    send_with_retry(request, label, |response| {
+        read_response_bytes(response, label)
+    })
+    .await
+    .map_err(|failure| failure.error)
 }
 
 /// Issue an authenticated JSON POST and normalize transport / status / parse
@@ -843,9 +846,7 @@ where
     // Unreachable: the loop always returns on the final attempt. Kept as a
     // defensive fallback instead of unwrap/panic.
     Err(HttpFailure::transport(last_error.unwrap_or_else(|| {
-        NovaVeilSearchError::Provider(format!(
-            "{provider} request failed with no attempts"
-        ))
+        NovaVeilSearchError::Provider(format!("{provider} request failed with no attempts"))
     })))
 }
 
@@ -872,7 +873,8 @@ pub async fn get_html(
         if is_anti_bot_challenge(&html) {
             return Err(NovaVeilSearchError::Provider(format!(
                 "{label} is rate-limited (anti-bot challenge; usually temporary)"
-            )).into());
+            ))
+            .into());
         }
         Ok(html)
     })
@@ -1008,7 +1010,10 @@ pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
     label: &str,
 ) -> std::result::Result<Value, HttpFailure> {
-    send_with_retry(request, label, |response| read_json_response(response, label)).await
+    send_with_retry(request, label, |response| {
+        read_json_response(response, label)
+    })
+    .await
 }
 
 async fn read_json_response(
@@ -1028,9 +1033,8 @@ async fn read_json_response(
 
     let bytes = read_response_bytes(response, label).await?;
 
-    serde_json::from_slice(&bytes).map_err(|err| {
-        NovaVeilSearchError::Parse(format!("invalid {label} JSON: {err}")).into()
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|err| NovaVeilSearchError::Parse(format!("invalid {label} JSON: {err}")).into())
 }
 
 async fn read_sse_json(
@@ -1043,8 +1047,11 @@ async fn read_sse_json(
     let mut last_json = None;
     let mut chat_metadata = None;
 
-    while let Some(chunk) = response.chunk().await
-        .map_err(|err| AttemptFailure::Network(err, "stream read"))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| AttemptFailure::Network(err, "stream read"))?
+    {
         buffer.extend_from_slice(&chunk);
 
         while let Some((event, rest)) = split_sse_event(&buffer) {
@@ -1443,7 +1450,10 @@ mod tests {
             );
         }
         let fixed = "socks5://fixed:%7Baccount%7D@proxy:1080";
-        assert_eq!(resolve_keyed_proxy(Some(fixed), "tavily", None).as_deref(), Some(fixed));
+        assert_eq!(
+            resolve_keyed_proxy(Some(fixed), "tavily", None).as_deref(),
+            Some(fixed)
+        );
     }
 
     #[test]
@@ -1451,7 +1461,8 @@ mod tests {
         let resolved = resolve_proxy_template(
             "socks5h://u%2540.{account}:p%2540%40ss@proxy:1080",
             "a@b:c/d%40",
-        ).unwrap();
+        )
+        .unwrap();
         let parsed = reqwest::Url::parse(&resolved).unwrap();
         assert_eq!(
             percent_encoding::percent_decode_str(parsed.username()).decode_utf8_lossy(),
@@ -1502,7 +1513,14 @@ mod tests {
             ("tinyfish", None),
             ("firecrawl", Some("")),
         ];
-        let clients = HttpClients::build(Duration::from_secs(5), Some(template), None, None, &keys, None);
+        let clients = HttpClients::build(
+            Duration::from_secs(5),
+            Some(template),
+            None,
+            None,
+            &keys,
+            None,
+        );
         // Tavily's two keys each get their own proxy-account client; empty
         // key lists (tinyfish / firecrawl) get none and fall back to shared.
         let tavily = clients.keyed_provider_clients("tavily");
@@ -1517,7 +1535,12 @@ mod tests {
 
     #[test]
     fn fixed_keyed_template_has_no_per_key_clients() {
-        let keys = [("tavily", Some("k1")), ("exa", None), ("tinyfish", None), ("firecrawl", None)];
+        let keys = [
+            ("tavily", Some("k1")),
+            ("exa", None),
+            ("tinyfish", None),
+            ("firecrawl", None),
+        ];
         let clients = HttpClients::build(
             Duration::from_secs(5),
             Some("socks5h://fixed:123@resin:2260"),
@@ -1527,6 +1550,9 @@ mod tests {
             None,
         );
         assert!(clients.keyed_provider_clients("tavily").is_empty());
-        assert!(std::ptr::eq(clients.keyed_client_for("tavily", Some("k1")), &clients.keyed));
+        assert!(std::ptr::eq(
+            clients.keyed_client_for("tavily", Some("k1")),
+            &clients.keyed
+        ));
     }
 }

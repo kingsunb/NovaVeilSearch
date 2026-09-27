@@ -12,8 +12,7 @@ use crate::error::{NovaVeilSearchError, Result};
 pub(crate) fn redact_urls(text: &str) -> String {
     static URLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     URLS.get_or_init(|| {
-        regex::Regex::new(r#"(?i)\b(?:https?|socks5h?)://[^\s<>\"']+"#)
-            .expect("static URL pattern")
+        regex::Regex::new(r#"(?i)\b(?:https?|socks5h?)://[^\s<>\"']+"#).expect("static URL pattern")
     })
     .replace_all(text, "[redacted URL]")
     .into_owned()

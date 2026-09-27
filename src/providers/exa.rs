@@ -17,9 +17,7 @@ use crate::model::search::SearchFilters;
 use crate::model::source::{FetchedPage, Source};
 use crate::providers::keyring::KeyRing;
 
-use super::http::{
-    build_client, post_json_with_header_auth_status, post_raw_json, rotate_keys,
-};
+use super::http::{build_client, post_json_with_header_auth_status, post_raw_json, rotate_keys};
 
 /// Exa's canonical auth channel. The docs also describe `Authorization:
 /// Bearer` as accepted, but every reference example uses this header — stick
@@ -119,16 +117,20 @@ impl ExaProvider {
 
         let body = exa_search_request_body(query, max_results, filters, now_unix_seconds());
         let endpoint = self.endpoint("search");
-        let raw = rotate_keys(&self.keys, "Exa", |key| async move {
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            post_json_with_header_auth_status(
-                client,
-                &endpoint,
-                (AUTH_HEADER, &key),
-                &body,
-                "Exa",
-            )
-            .await
+        let raw = rotate_keys(&self.keys, "Exa", |key| {
+            let endpoint = endpoint.clone();
+            let body = body.clone();
+            async move {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                post_json_with_header_auth_status(
+                    client,
+                    &endpoint,
+                    (AUTH_HEADER, &key),
+                    &body,
+                    "Exa",
+                )
+                .await
+            }
         })
         .await
         .map_err(|failure| failure.error)?;
@@ -144,16 +146,20 @@ impl ExaProvider {
         }
         let body = json!({ "urls": [url], "text": true });
         let endpoint = self.endpoint("contents");
-        let raw = rotate_keys(&self.keys, "Exa", |key| async move {
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            post_json_with_header_auth_status(
-                client,
-                &endpoint,
-                (AUTH_HEADER, &key),
-                &body,
-                "Exa",
-            )
-            .await
+        let raw = rotate_keys(&self.keys, "Exa", |key| {
+            let endpoint = endpoint.clone();
+            let body = body.clone();
+            async move {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                post_json_with_header_auth_status(
+                    client,
+                    &endpoint,
+                    (AUTH_HEADER, &key),
+                    &body,
+                    "Exa",
+                )
+                .await
+            }
         })
         .await
         .map_err(|failure| failure.error)?;

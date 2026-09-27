@@ -127,11 +127,14 @@ impl TavilyProvider {
             )
             .await;
         }
-        rotate_keys(&self.keys, "Tavily", |key| async move {
-            // The proxy account is bound to the signing key: a rotated request
-            // egresses through its own key's `{account}` client when one exists.
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            post_json_with_status(client, &endpoint, &key, body, "Tavily").await
+        rotate_keys(&self.keys, "Tavily", |key| {
+            let endpoint = endpoint.clone();
+            async move {
+                // The proxy account is bound to the signing key: a rotated request
+                // egresses through its own key's `{account}` client when one exists.
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                post_json_with_status(client, &endpoint, &key, body, "Tavily").await
+            }
         })
         .await
         .map_err(|failure| failure.error)

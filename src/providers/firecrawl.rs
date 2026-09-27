@@ -1,6 +1,8 @@
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::source::{FetchedPage, Source};
-use crate::providers::http::{build_client, post_json_optional_auth, post_json_with_status, rotate_keys};
+use crate::providers::http::{
+    build_client, post_json_optional_auth, post_json_with_status, rotate_keys,
+};
 use crate::providers::keyring::KeyRing;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -87,15 +89,18 @@ impl FirecrawlProvider {
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
-        if !self.keys.has_any_key() {
-            // No usable key (keyless anonymous mode, or an empty key value):
-            // send no `Authorization` header at all. A present key always
-            // wins over the keyless flag, exactly as before.
+        if self.keyless && !self.keys.has_any_key() {
+            // Explicit keyless mode with no key: send no `Authorization`
+            // header at all (Firecrawl's hosted endpoint works anonymously,
+            // rate-limited). A present key always wins over the keyless flag.
             return post_json_optional_auth(&self.client, &endpoint, None, body, "Firecrawl").await;
         }
-        rotate_keys(&self.keys, "Firecrawl", |key| async move {
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            post_json_with_status(client, &endpoint, &key, body, "Firecrawl").await
+        rotate_keys(&self.keys, "Firecrawl", |key| {
+            let endpoint = endpoint.clone();
+            async move {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                post_json_with_status(client, &endpoint, &key, body, "Firecrawl").await
+            }
         })
         .await
         .map_err(|failure| failure.error)

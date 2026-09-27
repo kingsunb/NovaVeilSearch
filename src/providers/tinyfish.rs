@@ -64,7 +64,13 @@ impl TinyfishProvider {
         fetch_api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
-        Self::with_clients(client, HashMap::new(), search_api_url, fetch_api_url, api_key)
+        Self::with_clients(
+            client,
+            HashMap::new(),
+            search_api_url,
+            fetch_api_url,
+            api_key,
+        )
     }
 
     /// [`with_client`] plus the per-key `{account}` proxy clients. Each
@@ -93,16 +99,19 @@ impl TinyfishProvider {
         filters: &SearchFilters,
     ) -> Result<Vec<Source>> {
         let params = tinyfish_search_params(query, filters);
-        let raw = rotate_keys(&self.keys, "TinyFish", |key| async move {
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            get_json_with_header_auth_status(
-                client,
-                &self.search_api_url,
-                &params,
-                (AUTH_HEADER, &key),
-                "TinyFish",
-            )
-            .await
+        let raw = rotate_keys(&self.keys, "TinyFish", |key| {
+            let params = params.clone();
+            async move {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                get_json_with_header_auth_status(
+                    client,
+                    &self.search_api_url,
+                    &params,
+                    (AUTH_HEADER, &key),
+                    "TinyFish",
+                )
+                .await
+            }
         })
         .await
         .map_err(|failure| failure.error)?;
@@ -115,16 +124,19 @@ impl TinyfishProvider {
 
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage> {
         let body = json!({ "urls": [url], "format": "markdown" });
-        let raw = rotate_keys(&self.keys, "TinyFish", |key| async move {
-            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
-            post_json_with_header_auth_status(
-                client,
-                &self.fetch_api_url,
-                (AUTH_HEADER, &key),
-                &body,
-                "TinyFish",
-            )
-            .await
+        let raw = rotate_keys(&self.keys, "TinyFish", |key| {
+            let body = body.clone();
+            async move {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                post_json_with_header_auth_status(
+                    client,
+                    &self.fetch_api_url,
+                    (AUTH_HEADER, &key),
+                    &body,
+                    "TinyFish",
+                )
+                .await
+            }
         })
         .await
         .map_err(|failure| failure.error)?;
