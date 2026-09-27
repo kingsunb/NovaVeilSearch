@@ -26,6 +26,7 @@ Which channel carries your config is decided by the MCP **transport**, not a pro
 | Firecrawl API key | `FIRECRAWL_API_KEY` |
 | TinyFish API key | `TINYFISH_API_KEY` |
 | Exa API key | `EXA_API_KEY` |
+| Serper API key | `SERPER_API_KEY` |
 | Tavily / Firecrawl / Exa anonymous mode | `TAVILY_KEYLESS` / `FIRECRAWL_KEYLESS` / `EXA_KEYLESS` |
 | DuckDuckGo / Bing enable & flavor | `DUCKDUCKGO_ENABLED`, `DUCKDUCKGO_REGION`, `BING_ENABLED`, `BING_MARKET` |
 | GitHub token | `GITHUB_TOKEN` |
@@ -126,7 +127,7 @@ GROK_SEARCH_WEB_SEARCH = "true"
 
 | Variable | Default | Description |
 |---|---|---|
-| `TAVILY_API_KEY` | unset | Enables Tavily-backed source enrichment, fallback, fetch, and map. Accepts a single key or a comma-separated list (`tvly-a,tvly-b`); multiple keys rotate round-robin per request, with automatic failover to the next key on key-scoped errors (HTTP 401/403/429/432/433). Tavily's multi-key contract is shared by every keyed provider: `FIRECRAWL_API_KEY`, `TINYFISH_API_KEY`, and `EXA_API_KEY` accept comma-separated lists the same way. |
+| `TAVILY_API_KEY` | unset | Enables Tavily-backed source enrichment, fallback, fetch, and map. Accepts a single key or a comma-separated list (`tvly-a,tvly-b`); multiple keys rotate round-robin per request, with automatic failover to the next key on key-scoped errors (HTTP 401/403/429/432/433). Tavily's multi-key contract is shared by every keyed provider: `FIRECRAWL_API_KEY`, `TINYFISH_API_KEY`, `EXA_API_KEY`, and `SERPER_API_KEY` accept comma-separated lists the same way. |
 | `TAVILY_API_URL` | `https://api.tavily.com` | Tavily API base URL. |
 | `TAVILY_ENABLED` | `true` | Optional override. Set to `false` only when you want to disable Tavily even if `TAVILY_API_KEY` is configured. |
 | `GROK_SEARCH_EXTRA_SOURCES` | `3` | Adds enrichment sources after a verifiable Grok result, served by the first source-chain provider with results. Set `0` to disable enrichment. |
@@ -174,6 +175,24 @@ Semantic (embeddings-first) search with native `includeDomains` / `excludeDomain
 | `EXA_API_URL` | `https://api.exa.ai` | Exa API base URL. |
 | `EXA_ENABLED` | `true` | Optional override. Set to `false` to disable Exa even if a key is configured. |
 
+## Serper
+
+Serper.dev wraps Google's organic search SERP in a structured JSON API keyed by
+an `X-API-KEY` header. It has a real free tier (≈2,500 searches/month) and needs
+no credit card — unlike Brave Search, whose official API is subscription-only
+(see [Source Providers](./SOURCE_PROVIDERS.md)). Serper is **search-only**:
+`web_fetch`/`web_map` do not route arbitrary URLs through it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERPER_API_KEY` | unset | Enables Serper in the source chain (supplemental sources). Accepts a comma-separated list like Tavily: multiple keys rotate round-robin per request with automatic failover on key-scoped errors (401/403/429/432/433). |
+| `SERPER_API_URL` | `https://google.serper.dev` | Serper API base URL (the `/search` path is appended). |
+| `SERPER_ENABLED` | `true` | Optional override. Set to `false` to disable Serper even if a key is configured. |
+
+Domain filters map to Google's `site:` / `-site:` query operators, and
+`recency_days` maps to the `tbs:qdr:d|w|m|y` recency bucket. `num` is clamped to
+Serper's 100-result cap.
+
 ## DuckDuckGo & Bing (keyless fallback engines)
 
 Two key-free scrapers back the source chain when no paid key is present. Both are
@@ -220,11 +239,11 @@ Set `GROK_SEARCH_PARALLEL_SOURCES=true` to fan out instead: every configured pro
 
 `web_map` is a separate capability, not part of this chain: it always uses Tavily whenever `TAVILY_API_KEY` is configured, even when the chain excludes Tavily.
 
-**The chain and the specialist extractors are different things.** A *source provider* (Tavily, Exa, TinyFish, DuckDuckGo, Bing, Firecrawl) is an external service — the first four are normally gated behind an API key, the last two are keyless scrapers. A *specialist extractor* (GitHub, StackExchange, arXiv, Wikipedia) is a key-free parser for one family of URLs; it is never configured and never part of the chain. So with **no source provider configured at all**, `web_fetch` still handles those four families, and fails on every ordinary URL — there is nothing left that can retrieve one. Inline enrichment in `web_search` behaves the same way and says so by name.
+**The chain and the specialist extractors are different things.** A *source provider* (Tavily, Exa, TinyFish, Serper, DuckDuckGo, Bing, Firecrawl) is an external service — the first five are normally gated behind an API key, the last two are keyless scrapers. A *specialist extractor* (GitHub, StackExchange, arXiv, Wikipedia) is a key-free parser for one family of URLs; it is never configured and never part of the chain. So with **no source provider configured at all**, `web_fetch` still handles those four families, and fails on every ordinary URL — there is nothing left that can retrieve one. Inline enrichment in `web_search` behaves the same way and says so by name.
 
 | Variable | Default | Description |
 |---|---|---|
-| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Comma-separated explicit chain order, e.g. `tinyfish,tavily,firecrawl` (valid names: `tavily`, `exa`, `tinyfish`, `duckduckgo`, `bing`, `firecrawl`). Unset = configured providers in canonical order `tavily, exa, tinyfish, duckduckgo, bing, firecrawl`. Unknown names fail at startup. |
+| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Comma-separated explicit chain order, e.g. `tinyfish,tavily,firecrawl` (valid names: `tavily`, `exa`, `tinyfish`, `serper`, `duckduckgo`, `bing`, `firecrawl`). Unset = configured providers in canonical order `tavily, exa, tinyfish, serper, duckduckgo, bing, firecrawl`. Unknown names fail at startup. |
 | `GROK_SEARCH_PARALLEL_SOURCES` | `false` | `true` = fan out to every configured provider concurrently and merge + dedupe their results, instead of the sequential first-wins chain. |
 
 ## Cache
@@ -352,6 +371,9 @@ Unknown keys are rejected by the loader — typos surface as parse errors instea
 | `exa_api_key` | `EXA_API_KEY` |
 | `exa_enabled` | `EXA_ENABLED` |
 | `exa_keyless` | `EXA_KEYLESS` |
+| `serper_api_url` | `SERPER_API_URL` |
+| `serper_api_key` | `SERPER_API_KEY` |
+| `serper_enabled` | `SERPER_ENABLED` |
 | `duckduckgo_enabled` | `DUCKDUCKGO_ENABLED` |
 | `duckduckgo_region` | `DUCKDUCKGO_REGION` |
 | `bing_enabled` | `BING_ENABLED` |
@@ -406,13 +428,16 @@ tavily_enabled        = true
 firecrawl_api_url     = "https://api.firecrawl.dev"
 firecrawl_api_key     = "fc-..."
 firecrawl_enabled     = true
+serper_api_url        = "https://google.serper.dev"
+serper_api_key        = "..."
+serper_enabled        = true
 # firecrawl_keyless   = false
 # exa_keyless         = false
 # duckduckgo_enabled  = true
 # duckduckgo_region   = "us-en"
 # bing_enabled        = true
 # bing_market         = "en-US"
-# proxy_key           = "socks5://proxy-a:1080"   # keyed providers (Tavily/Exa/TinyFish/Firecrawl)
+# proxy_key           = "socks5://proxy-a:1080"   # keyed providers (Tavily/Exa/TinyFish/Firecrawl/Serper)
 #                       # or a per-key template: "socks5h://Default.{account}:123@resin:2260"
 # proxy_keyless       = "socks5://proxy-b:1081"   # keyless engines + specialists
 # proxy_grok          = "socks5://proxy-c:1082"   # Grok engine (unset = direct)

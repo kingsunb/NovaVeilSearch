@@ -9,6 +9,7 @@ NovaVeilSearch 的「补充来源 + 失败兜底」是一条有序 provider 链�
 | Tavily | keyed（另有 `TAVILY_KEYLESS` 免 key 档） | RAG 搜索 / 正文提取 / 站点地图 |
 | Exa | keyed（另有 `EXA_KEYLESS` 免 key 档） | 语义搜索 + 原生域/日期过滤 |
 | TinyFish | keyed | 免费关键词搜索 + JS 渲染抓取 |
+| Serper | keyed | Google SERP 搜索（免费档 ~2500 次/月），search-only，域/日期过滤转 `site:`/`tbs:qdr:` |
 | DuckDuckGo | keyless 抓取 | 免 key，search-only |
 | Bing | keyless 抓取 | 免 key，search-only |
 | Firecrawl | keyed（另有 `FIRECRAWL_KEYLESS` 免 key 档） | 兜底抓取 / 搜索 |
@@ -28,6 +29,8 @@ Brave Search 拥有独立网页索引与原生时效过滤，本轮在对比参�
 - 网页抓取（仿 DuckDuckGo/Bing 抓 `search.brave.com`）非官方、易被反爬、结果易碎，不符合「可维护 provider」的标准。
 
 **结论：** 不加入 MCP 源链；`GROK_SEARCH_SOURCE_PROVIDERS` 不接受 `brave`，也不新增 `BRAVE_API_KEY` 等配置项。
+
+> 对比：**Serper** 同样需要 API key，但它有真实的免费档（约 2500 次/月）、注册无需信用卡/订阅，且返回结构化 JSON，因此被纳入「已接入」而非像 Brave 一样被拒。
 
 ### 其它候选（仅记录，未决定）
 

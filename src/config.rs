@@ -38,6 +38,9 @@ pub struct Config {
     pub exa_api_url: String,
     pub exa_api_key: Option<String>,
     pub exa_enabled: bool,
+    pub serper_api_url: String,
+    pub serper_api_key: Option<String>,
+    pub serper_enabled: bool,
     /// Keyless anonymous modes (`x-tavily-access-mode: keyless`). Default off:
     /// setting them on makes the provider instantiate even without a key.
     pub tavily_keyless: bool,
@@ -52,7 +55,7 @@ pub struct Config {
     /// Optional Bing market (`mkt`, e.g. `en-US`, `zh-CN`). Defaults to `en-US`.
     pub bing_market: Option<String>,
     /// Outbound proxy for the keyed source providers (Tavily/Exa/TinyFish/
-    /// Firecrawl). Accepts `http://`, `https://`, `socks5://`, `socks5h://`
+    /// Firecrawl/Serper). Accepts `http://`, `https://`, `socks5://`, `socks5h://`
     /// (optionally with embedded credentials). Empty / unset = direct connection.
     pub proxy_key: Option<String>,
     /// Outbound proxy for the keyless providers (DuckDuckGo/Bing) plus the
@@ -170,6 +173,9 @@ impl std::fmt::Debug for Config {
             .field("exa_api_url", &self.exa_api_url)
             .field("exa_api_key", &mask(&self.exa_api_key))
             .field("exa_enabled", &self.exa_enabled)
+            .field("serper_api_url", &self.serper_api_url)
+            .field("serper_api_key", &mask(&self.serper_api_key))
+            .field("serper_enabled", &self.serper_enabled)
             .field("tavily_keyless", &self.tavily_keyless)
             .field("firecrawl_keyless", &self.firecrawl_keyless)
             .field("exa_keyless", &self.exa_keyless)
@@ -234,6 +240,9 @@ struct ConfigFile {
     exa_api_url: Option<String>,
     exa_api_key: Option<String>,
     exa_enabled: Option<bool>,
+    serper_api_url: Option<String>,
+    serper_api_key: Option<String>,
+    serper_enabled: Option<bool>,
     tavily_keyless: Option<bool>,
     firecrawl_keyless: Option<bool>,
     exa_keyless: Option<bool>,
@@ -307,6 +316,9 @@ impl ConfigFile {
         insert("EXA_API_URL", self.exa_api_url);
         insert("EXA_API_KEY", self.exa_api_key);
         insert("EXA_ENABLED", self.exa_enabled.map(|b| b.to_string()));
+        insert("SERPER_API_URL", self.serper_api_url);
+        insert("SERPER_API_KEY", self.serper_api_key);
+        insert("SERPER_ENABLED", self.serper_enabled.map(|b| b.to_string()));
         insert("TAVILY_KEYLESS", self.tavily_keyless.map(|b| b.to_string()));
         insert(
             "FIRECRAWL_KEYLESS",
@@ -499,6 +511,19 @@ impl Config {
                 .cloned()
                 .filter(|value| !value.trim().is_empty()),
             exa_enabled: bool_value(&map, "EXA_ENABLED", true),
+            serper_api_url: normalize_plain_base(&get(
+                &map,
+                "SERPER_API_URL",
+                "https://google.serper.dev",
+            )),
+            // Blank means absent, as it does for every other keyed provider:
+            // keep a whitespace-only key from instantiating a provider that can
+            // only 401 on every call.
+            serper_api_key: map
+                .get("SERPER_API_KEY")
+                .cloned()
+                .filter(|value| !value.trim().is_empty()),
+            serper_enabled: bool_value(&map, "SERPER_ENABLED", true),
             tavily_keyless: bool_value(&map, "TAVILY_KEYLESS", false),
             firecrawl_keyless: bool_value(&map, "FIRECRAWL_KEYLESS", false),
             exa_keyless: bool_value(&map, "EXA_KEYLESS", false),
@@ -572,7 +597,7 @@ impl Config {
 
     pub fn redacted_diagnostics(&self) -> String {
         format!(
-            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} parallel_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} proxy_grok={} proxy_key={} proxy_keyless={} github_token={}",
+            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} serper_api_key={} tavily_keyless={} firecrawl_keyless={} exa_keyless={} duckduckgo_enabled={} bing_enabled={} default_extra_sources={} fallback_sources={} parallel_sources={} result_cache_size={} result_cache_ttl_seconds={} timeout_seconds={} proxy_grok={} proxy_key={} proxy_keyless={} github_token={}",
             redact_url(&self.grok_api_url),
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
@@ -587,6 +612,7 @@ impl Config {
             redact(self.firecrawl_api_key.as_deref()),
             redact(self.tinyfish_api_key.as_deref()),
             redact(self.exa_api_key.as_deref()),
+            redact(self.serper_api_key.as_deref()),
             self.tavily_keyless,
             self.firecrawl_keyless,
             self.exa_keyless,
@@ -606,19 +632,20 @@ impl Config {
     }
 }
 
-/// The four search sources the web settings editor manages (key'd providers
+/// The five search sources the web settings editor manages (key'd providers
 /// with editable `*_enabled` / `*_api_key` toggles). Keyless engines
 /// (DuckDuckGo, Bing) are configured only via `source_providers` / env and are
 /// intentionally absent from this map so the editor doesn't render toggles for
 /// providers that have no key to manage.
-const ALLOWED_SOURCE_NAMES: [&str; 4] = ["tavily", "exa", "tinyfish", "firecrawl"];
+const ALLOWED_SOURCE_NAMES: [&str; 5] = ["tavily", "exa", "tinyfish", "firecrawl", "serper"];
 
 /// Every provider name `source_providers` may legitimately reference, including
 /// the keyless engines. Used for validation and the error's valid-name list.
-const KNOWN_SOURCE_NAMES: [&str; 6] = [
+const KNOWN_SOURCE_NAMES: [&str; 7] = [
     "tavily",
     "exa",
     "tinyfish",
+    "serper",
     "duckduckgo",
     "bing",
     "firecrawl",
@@ -671,6 +698,8 @@ pub struct SourceEdits {
     pub tinyfish_api_key: Option<String>,
     pub exa_enabled: Option<bool>,
     pub exa_api_key: Option<String>,
+    pub serper_enabled: Option<bool>,
+    pub serper_api_key: Option<String>,
     pub source_providers: Option<Vec<String>>,
 }
 
@@ -690,7 +719,9 @@ pub fn load_source_config(env: &HashMap<String, String>) -> SourcesView {
             "tavily" => (cfg.tavily_enabled, &cfg.tavily_api_key),
             "firecrawl" => (cfg.firecrawl_enabled, &cfg.firecrawl_api_key),
             "tinyfish" => (cfg.tinyfish_enabled, &cfg.tinyfish_api_key),
-            _ => (cfg.exa_enabled, &cfg.exa_api_key),
+            "exa" => (cfg.exa_enabled, &cfg.exa_api_key),
+            "serper" => (cfg.serper_enabled, &cfg.serper_api_key),
+            _ => unreachable!("ALLOWED_SOURCE_NAMES is exhaustive"),
         };
         sources.insert(
             name.to_string(),
@@ -726,6 +757,7 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
         ("firecrawl_api_key", edits.firecrawl_api_key.as_deref()),
         ("tinyfish_api_key", edits.tinyfish_api_key.as_deref()),
         ("exa_api_key", edits.exa_api_key.as_deref()),
+        ("serper_api_key", edits.serper_api_key.as_deref()),
     ] {
         if let Some(raw) = value {
             let trimmed = raw.trim();
@@ -750,7 +782,7 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
                 errors.push(FieldError {
                     field: "source_providers".to_string(),
                     message: format!(
-                        "unknown source provider \"{name}\" (valid: tavily, exa, tinyfish, duckduckgo, bing, firecrawl)"
+                        "unknown source provider \"{name}\" (valid: tavily, exa, tinyfish, serper, duckduckgo, bing, firecrawl)"
                     ),
                 });
                 break;
@@ -802,6 +834,8 @@ fn env_override_map(env: &HashMap<String, String>) -> std::collections::BTreeMap
         ("tinyfish_api_key", "TINYFISH_API_KEY"),
         ("exa_enabled", "EXA_ENABLED"),
         ("exa_api_key", "EXA_API_KEY"),
+        ("serper_enabled", "SERPER_ENABLED"),
+        ("serper_api_key", "SERPER_API_KEY"),
         ("source_providers", "GROK_SEARCH_SOURCE_PROVIDERS"),
     ]
     .into_iter()
@@ -829,6 +863,11 @@ fn apply_edits(doc: &mut toml_edit::DocumentMut, edits: &SourceEdits) {
             edits.tinyfish_api_key.as_deref(),
         ),
         ("exa", edits.exa_enabled, edits.exa_api_key.as_deref()),
+        (
+            "serper",
+            edits.serper_enabled,
+            edits.serper_api_key.as_deref(),
+        ),
     ] {
         if let Some(value) = enabled {
             let key = format!("{base}_enabled");
@@ -1011,7 +1050,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# nova-veil-search global configuration
 # firecrawl_api_key  = "fc-..."       # Optional fetch fallback   https://firecrawl.dev
 # tinyfish_api_key   = "tf-..."       # Optional free search/fetch  https://tinyfish.ai
 # exa_api_key        = "exa-..."      # Optional semantic search    https://exa.ai
-# source_providers   = ["tavily", "exa", "tinyfish", "firecrawl"]
+# serper_api_key     = "..."          # Optional Google SERP search https://serper.dev
+# source_providers   = ["tavily", "exa", "tinyfish", "serper", "duckduckgo", "bing", "firecrawl"]
 #                                     # explicit chain order; omit for the
 #                                     # built-in order over configured providers
 
@@ -1022,11 +1062,12 @@ pub const CONFIG_TEMPLATE: &str = r#"# nova-veil-search global configuration
 # tinyfish_search_api_url = "https://api.search.tinyfish.ai"
 # tinyfish_fetch_api_url  = "https://api.fetch.tinyfish.ai"
 # exa_api_url             = "https://api.exa.ai"
+# serper_api_url          = "https://google.serper.dev"
 
 # ── Outbound proxy (all off by default) ────────────────────────
 # Route the search providers' outbound requests through a proxy. Empty/unset
 # means a direct connection. Schemes: http://, https://, socks5://, socks5h://
-#   proxy_key     = "socks5://127.0.0.1:1080"  # keyed providers (Tavily/Exa/TinyFish/Firecrawl)
+#   proxy_key     = "socks5://127.0.0.1:1080"  # keyed providers (Tavily/Exa/TinyFish/Firecrawl/Serper)
 #   # proxy_key may instead name an {account} placeholder in the username to
 #   # give each keyed provider its own per-key alias on a shared proxy:
 #   #   proxy_key = "socks5h://Default.{account}:123@resin:2260"
@@ -1049,6 +1090,7 @@ pub const CONFIG_TEMPLATE: &str = r#"# nova-veil-search global configuration
 # firecrawl_enabled  = true
 # tinyfish_enabled   = true
 # exa_enabled        = true
+# serper_enabled     = true
 
 # ── Behavior tuning ───────────────────────────────────────────
 # default_extra_sources = 3

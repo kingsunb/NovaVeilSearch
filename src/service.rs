@@ -18,6 +18,7 @@ use crate::providers::duckduckgo::DuckduckgoProvider;
 use crate::providers::exa::ExaProvider;
 use crate::providers::firecrawl::FirecrawlProvider;
 use crate::providers::grok::GrokResponsesProvider;
+use crate::providers::serper::SerperProvider;
 use crate::providers::tavily::TavilyProvider;
 use crate::providers::tinyfish::TinyfishProvider;
 
@@ -187,6 +188,30 @@ impl SourceProvider for BingProvider {
     }
 }
 
+#[async_trait]
+impl SourceProvider for SerperProvider {
+    async fn search_sources(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<Source>> {
+        self.search(query, max_results, filters).await
+    }
+
+    async fn fetch(&self, _url: &str) -> Result<FetchedPage> {
+        Err(NovaVeilSearchError::Provider(
+            "Serper provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+
+    async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
+        Err(NovaVeilSearchError::Provider(
+            "Serper provider is search-only (no web_fetch / web_map)".to_string(),
+        ))
+    }
+}
+
 /// Static description of one known source provider: how it is configured, how
 /// its absence is reported, and which request shapes it can honor. The
 /// service's source chain (`SourceSlot` list) is built from these at
@@ -287,16 +312,30 @@ const BING_SPEC: ProviderSpec = ProviderSpec {
     core: false,
 };
 
+const SERPER_SPEC: ProviderSpec = ProviderSpec {
+    name: "serper",
+    display: "Serper",
+    enable_var: "SERPER_ENABLED",
+    key_var: "SERPER_API_KEY",
+    header: "X-API-KEY",
+    supports_filters: true,
+    supports_map: false,
+    supports_fetch: false,
+    core: false,
+};
+
 /// Canonical chain order. Tavily's RAG-tuned results keep the primary slot;
 /// Exa (semantic search, native filter support) outranks the keyword engines
-/// among the newcomers; TinyFish is the free keyword/fetch tier; DuckDuckGo and
+/// among the newcomers; TinyFish is the free keyword/fetch tier; Serper wraps
+/// Google's SERP behind a key (keyed search, no fetch/map); DuckDuckGo and
 /// Bing are keyless free engines that can answer without any credentials;
 /// Firecrawl keeps its historical last-resort slot because its search cannot
 /// honor filters. `GROK_SEARCH_SOURCE_PROVIDERS` overrides this order entirely.
-const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 6] = [
+const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 7] = [
     &TAVILY_SPEC,
     &EXA_SPEC,
     &TINYFISH_SPEC,
+    &SERPER_SPEC,
     &DUCKDUCKGO_SPEC,
     &BING_SPEC,
     &FIRECRAWL_SPEC,
@@ -391,6 +430,23 @@ fn instantiate_source(
                 config.firecrawl_keyless,
             )) as Arc<dyn SourceProvider>)
         }
+        "serper" => {
+            if !config.serper_enabled {
+                return None;
+            }
+            // Serper has no keyless mode: an absent key means the provider
+            // cannot be instantiated.
+            let key = config.serper_api_key.clone().unwrap_or_default();
+            if key.is_empty() {
+                return None;
+            }
+            Some(Arc::new(SerperProvider::with_clients(
+                clients.keyed.clone(),
+                clients.keyed_provider_clients("serper"),
+                config.serper_api_url.clone(),
+                key,
+            )) as Arc<dyn SourceProvider>)
+        }
         "duckduckgo" => config.duckduckgo_enabled.then(|| {
             Arc::new(DuckduckgoProvider::with_client(
                 clients.keyless.clone(),
@@ -413,6 +469,7 @@ fn provider_enabled(spec: &ProviderSpec, config: &Config) -> bool {
         "exa" => config.exa_enabled,
         "tinyfish" => config.tinyfish_enabled,
         "firecrawl" => config.firecrawl_enabled,
+        "serper" => config.serper_enabled,
         "duckduckgo" => config.duckduckgo_enabled,
         "bing" => config.bing_enabled,
         _ => false,
@@ -435,7 +492,7 @@ pub fn validate_source_providers(config: &Config) -> Result<()> {
     for name in &config.source_providers {
         if !CANONICAL_SOURCE_ORDER.iter().any(|spec| spec.name == name) {
             return Err(NovaVeilSearchError::InvalidParams(format!(
-                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, duckduckgo, bing, firecrawl)"
+                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, serper, duckduckgo, bing, firecrawl)"
             )));
         }
     }
@@ -613,6 +670,7 @@ fn proxy_clients(config: &Config) -> crate::providers::http::HttpClients {
         ("exa", config.exa_api_key.as_deref()),
         ("tinyfish", config.tinyfish_api_key.as_deref()),
         ("firecrawl", config.firecrawl_api_key.as_deref()),
+        ("serper", config.serper_api_key.as_deref()),
     ];
     let grok_key = config
         .grok_api_key
@@ -1612,6 +1670,7 @@ impl SearchService {
         let exa_probe = self.probe_chain_source("exa").await;
         let tinyfish_probe = self.probe_chain_source("tinyfish").await;
         let firecrawl_probe = self.probe_chain_source("firecrawl").await;
+        let serper_probe = self.probe_chain_source("serper").await;
         let duckduckgo_probe = self.probe_chain_source("duckduckgo").await;
         let bing_probe = self.probe_chain_source("bing").await;
         let source_chain: Vec<&str> = self
@@ -1693,6 +1752,12 @@ impl SearchService {
                 "enabled": self.config.firecrawl_enabled,
                 "reachable": firecrawl_probe.ok,
                 "detail": firecrawl_probe.detail,
+            },
+            "serper": {
+                "api_url": crate::config::redact_url(&self.config.serper_api_url),
+                "enabled": self.config.serper_enabled,
+                "reachable": serper_probe.ok,
+                "detail": serper_probe.detail,
             },
             "duckduckgo": {
                 "enabled": self.config.duckduckgo_enabled,
