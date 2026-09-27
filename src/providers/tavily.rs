@@ -1,8 +1,10 @@
 use crate::error::Result;
 use crate::model::search::SearchFilters;
 use crate::model::source::{FetchedPage, Source};
-use crate::providers::http::{build_client, post_json_with_header_auth, post_json_with_status};
-use crate::providers::keyring::{is_key_scoped_status, KeyRing};
+use crate::providers::http::{
+    build_client, post_json_with_header_auth, post_json_with_status, rotate_keys,
+};
+use crate::providers::keyring::KeyRing;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -108,10 +110,11 @@ impl TavilyProvider {
         ))
     }
 
-    /// POST with round-robin key selection. On a key-scoped failure
-    /// (401/403/429/432/433) the request is retried once per remaining key;
-    /// Network retries happen within the shared HTTP helper using the same key;
-    /// other failures (5xx, parse) return without rotating keys.
+    /// POST with round-robin key selection: each request starts at the shared
+    /// cursor's next key, and a key-scoped failure (401/403/429/432/433)
+    /// retries once per remaining key. Network retries happen within the
+    /// shared HTTP helper using the same key; other failures (5xx, parse)
+    /// return without rotating keys.
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
         if self.keyless && !self.keys.has_any_key() {
@@ -124,37 +127,14 @@ impl TavilyProvider {
             )
             .await;
         }
-        let attempts = self.keys.len();
-        let start = self.keys.start();
-        let mut last_error = None;
-        for offset in 0..attempts {
-            let key = self.keys.key(start + offset);
+        rotate_keys(&self.keys, "Tavily", |key| async move {
             // The proxy account is bound to the signing key: a rotated request
             // egresses through its own key's `{account}` client when one exists.
-            let client = self.per_key_clients.get(key).unwrap_or(&self.client);
-            match post_json_with_status(client, &endpoint, key, body, "Tavily").await {
-                Ok(value) => return Ok(value),
-                Err(failure) => {
-                    let key_scoped = failure.status.is_some_and(is_key_scoped_status);
-                    if key_scoped && offset + 1 < attempts {
-                        eprintln!(
-                            "nova-veil-search: Tavily key {}/{} hit HTTP {}; rotating to next key",
-                            (start + offset) % attempts + 1,
-                            attempts,
-                            failure.status.unwrap_or_default(),
-                        );
-                        last_error = Some(failure.error);
-                        continue;
-                    }
-                    return Err(failure.error);
-                }
-            }
-        }
-        // Unreachable: the loop always returns on the final attempt. Kept as
-        // a defensive fallback instead of unwrap/panic.
-        Err(last_error.unwrap_or_else(|| {
-            NovaVeilSearchError::Provider("Tavily request failed with no attempts".to_string())
-        }))
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            post_json_with_status(client, &endpoint, &key, body, "Tavily").await
+        })
+        .await
+        .map_err(|failure| failure.error)
     }
 }
 

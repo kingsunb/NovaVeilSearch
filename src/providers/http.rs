@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use crate::error::{NovaVeilSearchError, Result};
 
+use super::keyring::{is_key_scoped_status, KeyRing};
+
 /// Parse a proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`,
 /// optionally with embedded credentials) into a reqwest [`Proxy`] that applies
 /// to every protocol. `None` when the value is empty/whitespace. An unparsable
@@ -765,6 +767,86 @@ pub async fn post_json_optional_auth(
     send_json(request, label)
         .await
         .map_err(|failure| failure.error)
+}
+
+/// Status-aware variant of [`post_json_with_header_auth`]: identical request,
+/// but non-2xx responses carry their HTTP status alongside the normalized
+/// error so multi-key providers can make key-rotation decisions.
+pub async fn post_json_with_header_auth_status(
+    client: &Client,
+    endpoint: &str,
+    header: (&str, &str),
+    body: &Value,
+    label: &str,
+) -> std::result::Result<Value, HttpFailure> {
+    send_json(
+        client.post(endpoint).header(header.0, header.1).json(body),
+        label,
+    )
+    .await
+}
+
+/// Status-aware variant of [`get_json_with_header_auth`], for the GET-style
+/// search APIs. Same error shape as [`post_json_with_header_auth_status`].
+pub async fn get_json_with_header_auth_status(
+    client: &Client,
+    endpoint: &str,
+    query: &[(&str, String)],
+    header: (&str, &str),
+    label: &str,
+) -> std::result::Result<Value, HttpFailure> {
+    send_json(
+        client.get(endpoint).query(query).header(header.0, header.1),
+        label,
+    )
+    .await
+}
+
+/// Run one attempt per key of a [`KeyRing`], starting at the ring's shared
+/// round-robin cursor and rotating to the next key on key-scoped failures
+/// (401/403/429/432/433 — the statuses that indict the key, not the request).
+/// Network retries happen inside the shared HTTP helper per attempt; the
+/// closure receives the exact key to sign with and must route through its
+/// matching per-key `{account}` proxy client when one exists.
+pub(crate) async fn rotate_keys<T, F, Fut>(
+    keys: &KeyRing,
+    provider: &str,
+    mut attempt: F,
+) -> std::result::Result<T, HttpFailure>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, HttpFailure>>,
+{
+    let attempts = keys.len();
+    let start = keys.start();
+    let mut last_error = None;
+    for offset in 0..attempts {
+        let key = keys.key(start + offset).to_string();
+        match attempt(key).await {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                let key_scoped = failure.status.is_some_and(is_key_scoped_status);
+                if key_scoped && offset + 1 < attempts {
+                    eprintln!(
+                        "nova-veil-search: {provider} key {}/{} hit HTTP {}; rotating to next key",
+                        (start + offset) % attempts + 1,
+                        attempts,
+                        failure.status.unwrap_or_default(),
+                    );
+                    last_error = Some(failure.error);
+                    continue;
+                }
+                return Err(failure);
+            }
+        }
+    }
+    // Unreachable: the loop always returns on the final attempt. Kept as a
+    // defensive fallback instead of unwrap/panic.
+    Err(HttpFailure::transport(last_error.unwrap_or_else(|| {
+        NovaVeilSearchError::Provider(format!(
+            "{provider} request failed with no attempts"
+        ))
+    })))
 }
 
 /// Fetch a plain HTML page with browser-like headers and normalize transport /

@@ -1,15 +1,22 @@
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::source::{FetchedPage, Source};
-use crate::providers::http::{build_client, post_json_optional_auth};
+use crate::providers::http::{build_client, post_json_optional_auth, post_json_with_status, rotate_keys};
+use crate::providers::keyring::KeyRing;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone)]
 pub struct FirecrawlProvider {
     client: Client,
+    /// Per-key `{account}` proxy clients (exact key → client): the request
+    /// egresses through the proxy account derived from whichever key in the
+    /// ring signs it. Empty when no keyed proxy template names `{account}`.
+    per_key_clients: Arc<HashMap<String, Client>>,
     api_url: String,
-    api_key: String,
+    keys: Arc<KeyRing>,
     /// Keyless anonymous mode: send no `Authorization` header (Firecrawl's
     /// hosted `/v2` search/scrape works anonymously, rate-limited).
     keyless: bool,
@@ -22,15 +29,19 @@ impl FirecrawlProvider {
 
     /// Construct with an externally provided `reqwest::Client`. Used by
     /// `SearchService::new` to share one tuned client across providers.
+    ///
+    /// `api_key` accepts a single key or a comma-separated list; multiple
+    /// keys rotate round-robin per request with automatic failover on
+    /// key-scoped errors (401/403/429/432/433).
     pub fn with_client(
         client: Client,
         api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
-        Self::with_client_mode(client, api_url, api_key, false)
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, false)
     }
 
-    /// [`with_client`] plus a keyless flag. Keyless + empty key = no auth
+    /// [`with_client`] plus a keyless flag. Keyless + no key = no auth
     /// header at all.
     pub fn with_client_mode(
         client: Client,
@@ -38,10 +49,24 @@ impl FirecrawlProvider {
         api_key: impl Into<String>,
         keyless: bool,
     ) -> Self {
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, keyless)
+    }
+
+    /// [`with_client_mode`] plus the per-key `{account}` proxy clients. Each
+    /// rotating request looks up the client for the exact key it signs with,
+    /// so one template lands every key on its own proxy account.
+    pub fn with_clients_mode(
+        client: Client,
+        per_key_clients: HashMap<String, Client>,
+        api_url: impl Into<String>,
+        api_key: impl Into<String>,
+        keyless: bool,
+    ) -> Self {
         Self {
             client,
+            per_key_clients: Arc::new(per_key_clients),
             api_url: api_url.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
+            keys: Arc::new(KeyRing::parse(&api_key.into())),
             keyless,
         }
     }
@@ -62,12 +87,18 @@ impl FirecrawlProvider {
 
     async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let endpoint = format!("{}/{}", self.api_url, path.trim_start_matches('/'));
-        let key = if self.keyless && self.api_key.is_empty() {
-            None
-        } else {
-            Some(self.api_key.as_str())
-        };
-        post_json_optional_auth(&self.client, &endpoint, key, body, "Firecrawl").await
+        if !self.keys.has_any_key() {
+            // No usable key (keyless anonymous mode, or an empty key value):
+            // send no `Authorization` header at all. A present key always
+            // wins over the keyless flag, exactly as before.
+            return post_json_optional_auth(&self.client, &endpoint, None, body, "Firecrawl").await;
+        }
+        rotate_keys(&self.keys, "Firecrawl", |key| async move {
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            post_json_with_status(client, &endpoint, &key, body, "Firecrawl").await
+        })
+        .await
+        .map_err(|failure| failure.error)
     }
 }
 

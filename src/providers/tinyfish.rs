@@ -5,6 +5,8 @@
 //! Both authenticate with an `X-API-Key` header rather than a bearer token,
 //! and neither consumes account credits (rate limits still apply).
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -13,8 +15,11 @@ use serde_json::{json, Value};
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::search::SearchFilters;
 use crate::model::source::{FetchedPage, Source};
+use crate::providers::keyring::KeyRing;
 
-use super::http::{build_client, get_json_with_header_auth, post_json_with_header_auth};
+use super::http::{
+    build_client, get_json_with_header_auth_status, post_json_with_header_auth_status, rotate_keys,
+};
 
 const AUTH_HEADER: &str = "X-API-Key";
 /// TinyFish caps `recency_minutes` at ten years.
@@ -23,9 +28,13 @@ const MAX_RECENCY_MINUTES: u64 = 5_256_000;
 #[derive(Clone)]
 pub struct TinyfishProvider {
     client: Client,
+    /// Per-key `{account}` proxy clients (exact key → client): the request
+    /// egresses through the proxy account derived from whichever key in the
+    /// ring signs it. Empty when no keyed proxy template names `{account}`.
+    per_key_clients: Arc<HashMap<String, Client>>,
     search_api_url: String,
     fetch_api_url: String,
-    api_key: String,
+    keys: Arc<KeyRing>,
 }
 
 impl TinyfishProvider {
@@ -45,17 +54,35 @@ impl TinyfishProvider {
 
     /// Construct with an externally provided `reqwest::Client`. Used by
     /// `SearchService` to share one tuned client across providers.
+    ///
+    /// `api_key` accepts a single key or a comma-separated list; multiple
+    /// keys rotate round-robin per request with automatic failover on
+    /// key-scoped errors (401/403/429/432/433).
     pub fn with_client(
         client: Client,
         search_api_url: impl Into<String>,
         fetch_api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
+        Self::with_clients(client, HashMap::new(), search_api_url, fetch_api_url, api_key)
+    }
+
+    /// [`with_client`] plus the per-key `{account}` proxy clients. Each
+    /// rotating request looks up the client for the exact key it signs with,
+    /// so one template lands every key on its own proxy account.
+    pub fn with_clients(
+        client: Client,
+        per_key_clients: HashMap<String, Client>,
+        search_api_url: impl Into<String>,
+        fetch_api_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
         Self {
             client,
+            per_key_clients: Arc::new(per_key_clients),
             search_api_url: search_api_url.into().trim_end_matches('/').to_string(),
             fetch_api_url: fetch_api_url.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
+            keys: Arc::new(KeyRing::parse(&api_key.into())),
         }
     }
 
@@ -65,14 +92,20 @@ impl TinyfishProvider {
         max_results: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<Source>> {
-        let raw = get_json_with_header_auth(
-            &self.client,
-            &self.search_api_url,
-            &tinyfish_search_params(query, filters),
-            (AUTH_HEADER, &self.api_key),
-            "TinyFish",
-        )
-        .await?;
+        let params = tinyfish_search_params(query, filters);
+        let raw = rotate_keys(&self.keys, "TinyFish", |key| async move {
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            get_json_with_header_auth_status(
+                client,
+                &self.search_api_url,
+                &params,
+                (AUTH_HEADER, &key),
+                "TinyFish",
+            )
+            .await
+        })
+        .await
+        .map_err(|failure| failure.error)?;
         // The API has no result-count parameter (only pagination), so the
         // caller's budget is applied client-side.
         let mut sources = normalize_tinyfish_results(&raw);
@@ -81,14 +114,20 @@ impl TinyfishProvider {
     }
 
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage> {
-        let raw = post_json_with_header_auth(
-            &self.client,
-            &self.fetch_api_url,
-            (AUTH_HEADER, &self.api_key),
-            &json!({ "urls": [url], "format": "markdown" }),
-            "TinyFish",
-        )
-        .await?;
+        let body = json!({ "urls": [url], "format": "markdown" });
+        let raw = rotate_keys(&self.keys, "TinyFish", |key| async move {
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            post_json_with_header_auth_status(
+                client,
+                &self.fetch_api_url,
+                (AUTH_HEADER, &key),
+                &body,
+                "TinyFish",
+            )
+            .await
+        })
+        .await
+        .map_err(|failure| failure.error)?;
         parse_tinyfish_fetch(&raw, url)
     }
 }

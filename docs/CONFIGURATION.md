@@ -126,7 +126,7 @@ GROK_SEARCH_WEB_SEARCH = "true"
 
 | Variable | Default | Description |
 |---|---|---|
-| `TAVILY_API_KEY` | unset | Enables Tavily-backed source enrichment, fallback, fetch, and map. Accepts a single key or a comma-separated list (`tvly-a,tvly-b`); multiple keys rotate round-robin per request, with automatic failover to the next key on key-scoped errors (HTTP 401/403/429/432/433). |
+| `TAVILY_API_KEY` | unset | Enables Tavily-backed source enrichment, fallback, fetch, and map. Accepts a single key or a comma-separated list (`tvly-a,tvly-b`); multiple keys rotate round-robin per request, with automatic failover to the next key on key-scoped errors (HTTP 401/403/429/432/433). Tavily's multi-key contract is shared by every keyed provider: `FIRECRAWL_API_KEY`, `TINYFISH_API_KEY`, and `EXA_API_KEY` accept comma-separated lists the same way. |
 | `TAVILY_API_URL` | `https://api.tavily.com` | Tavily API base URL. |
 | `TAVILY_ENABLED` | `true` | Optional override. Set to `false` only when you want to disable Tavily even if `TAVILY_API_KEY` is configured. |
 | `GROK_SEARCH_EXTRA_SOURCES` | `3` | Adds enrichment sources after a verifiable Grok result, served by the first source-chain provider with results. Set `0` to disable enrichment. |
@@ -136,7 +136,7 @@ GROK_SEARCH_WEB_SEARCH = "true"
 
 | Variable | Default | Description |
 |---|---|---|
-| `FIRECRAWL_API_KEY` | unset | Enables Firecrawl fallback for `web_fetch` and supplemental fallback sources. |
+| `FIRECRAWL_API_KEY` | unset | Enables Firecrawl fallback for `web_fetch` and supplemental fallback sources. Accepts a comma-separated list like Tavily: multiple keys rotate round-robin per request with automatic failover on key-scoped errors (401/403/429/432/433). |
 | `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Firecrawl API base URL. Defaults to `/v2`; explicit `/v1` or `/v2` is preserved. |
 | `FIRECRAWL_ENABLED` | `true` | Optional override. Set to `false` to disable Firecrawl even if a key is configured. |
 
@@ -157,7 +157,7 @@ Free Search & Fetch APIs built for agents (no credits consumed; rate limits appl
 
 | Variable | Default | Description |
 |---|---|---|
-| `TINYFISH_API_KEY` | unset | Enables TinyFish in the source chain (supplemental sources + generic fetch). One key serves both endpoints. |
+| `TINYFISH_API_KEY` | unset | Enables TinyFish in the source chain (supplemental sources + generic fetch). One key serves both endpoints. Accepts a comma-separated list like Tavily: multiple keys rotate round-robin per request with automatic failover on key-scoped errors (401/403/429/432/433). |
 | `TINYFISH_SEARCH_API_URL` | `https://api.search.tinyfish.ai` | Search endpoint (GET). |
 | `TINYFISH_FETCH_API_URL` | `https://api.fetch.tinyfish.ai` | Fetch endpoint (POST). |
 | `TINYFISH_ENABLED` | `true` | Optional override. Set to `false` to disable TinyFish even if a key is configured. |
@@ -170,7 +170,7 @@ Semantic (embeddings-first) search with native `includeDomains` / `excludeDomain
 
 | Variable | Default | Description |
 |---|---|---|
-| `EXA_API_KEY` | unset | Enables Exa in the source chain (supplemental sources + `/contents` fetch). |
+| `EXA_API_KEY` | unset | Enables Exa in the source chain (supplemental sources + `/contents` fetch). Accepts a comma-separated list like Tavily: multiple keys rotate round-robin per request with automatic failover on key-scoped errors (401/403/429/432/433). |
 | `EXA_API_URL` | `https://api.exa.ai` | Exa API base URL. |
 | `EXA_ENABLED` | `true` | Optional override. Set to `false` to disable Exa even if a key is configured. |
 

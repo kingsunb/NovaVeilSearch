@@ -5,6 +5,8 @@
 //! whole `SearchFilters` contract (domain include/exclude lists and a
 //! published-date lower bound). Fetch goes through `/contents`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
@@ -13,8 +15,11 @@ use serde_json::{json, Value};
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::search::SearchFilters;
 use crate::model::source::{FetchedPage, Source};
+use crate::providers::keyring::KeyRing;
 
-use super::http::{build_client, post_json_with_header_auth, post_raw_json};
+use super::http::{
+    build_client, post_json_with_header_auth_status, post_raw_json, rotate_keys,
+};
 
 /// Exa's canonical auth channel. The docs also describe `Authorization:
 /// Bearer` as accepted, but every reference example uses this header — stick
@@ -31,8 +36,12 @@ const EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 #[derive(Clone)]
 pub struct ExaProvider {
     client: Client,
+    /// Per-key `{account}` proxy clients (exact key → client): the request
+    /// egresses through the proxy account derived from whichever key in the
+    /// ring signs it. Empty when no keyed proxy template names `{account}`.
+    per_key_clients: Arc<HashMap<String, Client>>,
     api_url: String,
-    api_key: String,
+    keys: Arc<KeyRing>,
     /// Keyless anonymous mode: route search through Exa's public MCP
     /// (`web_search_exa`) with no API key.
     keyless: bool,
@@ -46,15 +55,19 @@ impl ExaProvider {
 
     /// Construct with an externally provided `reqwest::Client`. Used by
     /// `SearchService` to share one tuned client across providers.
+    ///
+    /// `api_key` accepts a single key or a comma-separated list; multiple
+    /// keys rotate round-robin per request with automatic failover on
+    /// key-scoped errors (401/403/429/432/433).
     pub fn with_client(
         client: Client,
         api_url: impl Into<String>,
         api_key: impl Into<String>,
     ) -> Self {
-        Self::with_client_mode(client, api_url, api_key, false)
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, false)
     }
 
-    /// [`with_client`] plus a keyless flag. Keyless + empty key = Exa MCP
+    /// [`with_client`] plus a keyless flag. Keyless + no key = Exa MCP
     /// anonymous search; a present key always takes the keyed REST path.
     pub fn with_client_mode(
         client: Client,
@@ -62,10 +75,24 @@ impl ExaProvider {
         api_key: impl Into<String>,
         keyless: bool,
     ) -> Self {
+        Self::with_clients_mode(client, HashMap::new(), api_url, api_key, keyless)
+    }
+
+    /// [`with_client_mode`] plus the per-key `{account}` proxy clients. Each
+    /// rotating request looks up the client for the exact key it signs with,
+    /// so one template lands every key on its own proxy account.
+    pub fn with_clients_mode(
+        client: Client,
+        per_key_clients: HashMap<String, Client>,
+        api_url: impl Into<String>,
+        api_key: impl Into<String>,
+        keyless: bool,
+    ) -> Self {
         Self {
             client,
+            per_key_clients: Arc::new(per_key_clients),
             api_url: api_url.into().trim_end_matches('/').to_string(),
-            api_key: api_key.into(),
+            keys: Arc::new(KeyRing::parse(&api_key.into())),
             keyless,
             mcp_url: EXA_MCP_URL.to_string(),
         }
@@ -81,7 +108,7 @@ impl ExaProvider {
         max_results: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<Source>> {
-        if self.keyless && self.api_key.is_empty() {
+        if self.keyless && !self.keys.has_any_key() {
             if !filters.is_empty() {
                 return Err(NovaVeilSearchError::Provider(
                     "Exa keyless (MCP) mode cannot honor domain/recency filters; set EXA_API_KEY for filtered Exa search".to_string(),
@@ -91,32 +118,45 @@ impl ExaProvider {
         }
 
         let body = exa_search_request_body(query, max_results, filters, now_unix_seconds());
-        let raw = post_json_with_header_auth(
-            &self.client,
-            &self.endpoint("search"),
-            (AUTH_HEADER, &self.api_key),
-            &body,
-            "Exa",
-        )
-        .await?;
+        let endpoint = self.endpoint("search");
+        let raw = rotate_keys(&self.keys, "Exa", |key| async move {
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            post_json_with_header_auth_status(
+                client,
+                &endpoint,
+                (AUTH_HEADER, &key),
+                &body,
+                "Exa",
+            )
+            .await
+        })
+        .await
+        .map_err(|failure| failure.error)?;
         Ok(normalize_exa_results(&raw))
     }
 
     pub async fn fetch(&self, url: &str) -> Result<FetchedPage> {
-        if self.keyless && self.api_key.is_empty() {
+        if self.keyless && !self.keys.has_any_key() {
             return Err(NovaVeilSearchError::Provider(
                 "Exa keyless (MCP) mode supports search only; set EXA_API_KEY for Exa page fetch"
                     .to_string(),
             ));
         }
-        let raw = post_json_with_header_auth(
-            &self.client,
-            &self.endpoint("contents"),
-            (AUTH_HEADER, &self.api_key),
-            &json!({ "urls": [url], "text": true }),
-            "Exa",
-        )
-        .await?;
+        let body = json!({ "urls": [url], "text": true });
+        let endpoint = self.endpoint("contents");
+        let raw = rotate_keys(&self.keys, "Exa", |key| async move {
+            let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+            post_json_with_header_auth_status(
+                client,
+                &endpoint,
+                (AUTH_HEADER, &key),
+                &body,
+                "Exa",
+            )
+            .await
+        })
+        .await
+        .map_err(|failure| failure.error)?;
         parse_exa_contents(&raw, url)
     }
 

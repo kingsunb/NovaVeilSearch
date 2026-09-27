@@ -354,10 +354,9 @@ fn instantiate_source(
             if key.is_empty() && !config.exa_keyless {
                 return None;
             }
-            Some(Arc::new(ExaProvider::with_client_mode(
-                clients
-                    .keyed_client_for("exa", config.exa_api_key.as_deref())
-                    .clone(),
+            Some(Arc::new(ExaProvider::with_clients_mode(
+                clients.keyed.clone(),
+                clients.keyed_provider_clients("exa"),
                 config.exa_api_url.clone(),
                 key,
                 config.exa_keyless,
@@ -368,10 +367,9 @@ fn instantiate_source(
             .then(|| config.tinyfish_api_key.clone())
             .flatten()
             .map(|key| {
-                Arc::new(TinyfishProvider::with_client(
-                    clients
-                        .keyed_client_for("tinyfish", config.tinyfish_api_key.as_deref())
-                        .clone(),
+                Arc::new(TinyfishProvider::with_clients(
+                    clients.keyed.clone(),
+                    clients.keyed_provider_clients("tinyfish"),
                     config.tinyfish_search_api_url.clone(),
                     config.tinyfish_fetch_api_url.clone(),
                     key,
@@ -385,10 +383,9 @@ fn instantiate_source(
             if key.is_empty() && !config.firecrawl_keyless {
                 return None;
             }
-            Some(Arc::new(FirecrawlProvider::with_client_mode(
-                clients
-                    .keyed_client_for("firecrawl", config.firecrawl_api_key.as_deref())
-                    .clone(),
+            Some(Arc::new(FirecrawlProvider::with_clients_mode(
+                clients.keyed.clone(),
+                clients.keyed_provider_clients("firecrawl"),
                 config.firecrawl_api_url.clone(),
                 key,
                 config.firecrawl_keyless,
