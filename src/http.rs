@@ -370,7 +370,10 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
                 "/api/config",
                 get(crate::web::get_config).put(crate::web::put_config),
             )
-            .route("/api/config/keys/{source}/{key_id}", get(crate::web::get_key))
+            .route(
+                "/api/config/keys/{source}/{key_id}",
+                get(crate::web::get_key),
+            )
             .route("/api/config/export", get(crate::web::export_config));
     }
 

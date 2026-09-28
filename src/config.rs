@@ -786,8 +786,14 @@ fn source_urls(cfg: &Config, source: &str) -> std::collections::BTreeMap<String,
             ("mcp_endpoint", "https://mcp.exa.ai/mcp"),
         ],
         "tinyfish" => vec![
-            ("tinyfish_search_api_url", cfg.tinyfish_search_api_url.as_str()),
-            ("tinyfish_fetch_api_url", cfg.tinyfish_fetch_api_url.as_str()),
+            (
+                "tinyfish_search_api_url",
+                cfg.tinyfish_search_api_url.as_str(),
+            ),
+            (
+                "tinyfish_fetch_api_url",
+                cfg.tinyfish_fetch_api_url.as_str(),
+            ),
         ],
         "serper" => vec![("serper_api_url", cfg.serper_api_url.as_str())],
         "firecrawl" => vec![("firecrawl_api_url", cfg.firecrawl_api_url.as_str())],
@@ -1092,7 +1098,9 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
                     (Some(id), None) => {
                         !id.is_empty()
                             && id.len() <= 64
-                            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
                     }
                     (None, Some(value)) => {
                         !value.trim().is_empty()
@@ -1140,7 +1148,8 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
         if model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
             errors.push(FieldError {
                 field: "grok_model".into(),
-                message: "model must be nonempty and at most 256 bytes, without control characters".into(),
+                message: "model must be nonempty and at most 256 bytes, without control characters"
+                    .into(),
             });
         }
     }

@@ -608,7 +608,8 @@ fn build_providers(
                         .or_else(crate::config::auth_path)
                         .ok_or_else(|| {
                             NovaVeilSearchError::OAuth(
-                                "oauth_auth_path_unavailable: set GROK_SEARCH_AUTH_FILE".to_string(),
+                                "oauth_auth_path_unavailable: set GROK_SEARCH_AUTH_FILE"
+                                    .to_string(),
                             )
                         })?;
                     GrokResponsesProvider::with_credential_client(
