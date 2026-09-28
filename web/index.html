@@ -17,7 +17,7 @@
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
   body { margin: 0; font-size: 14px; line-height: 1.65; }
-  button, input { font: inherit; }
+  button, input, select { font: inherit; }
   button, a, input { -webkit-tap-highlight-color: transparent; }
   button { cursor: pointer; }
   button:disabled { cursor: not-allowed; opacity: .45; }
@@ -104,7 +104,7 @@
   .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; scroll-margin-top: 20px; }
   .section-title h2 { font-size: 15px; font-weight: 650; }
   .section-title p { font-size: 11px; color: var(--muted); margin-top: 3px; }
-  .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
   .source-card { min-width: 0; border: 1px solid var(--line); border-radius: 13px; padding: 19px; background: var(--surface); transition: border-color .15s; }
   .source-card.is-edited { border-color: #85bca3; }
   .source-top { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; }
@@ -124,6 +124,28 @@
   .capability { font-size: 9px; color: #758477; border: 1px solid #e7ece3; padding: 1px 6px; border-radius: 4px; }
   .key-label { display: flex; align-items: center; justify-content: space-between; gap: 5px; font-size: 10px; color: var(--muted); margin-bottom: 7px; }
   .key-row { display: flex; align-items: center; gap: 5px; }
+  .key-list { display: grid; gap: 8px; margin-bottom: 10px; max-height: 264px; overflow-y: auto; }
+  .key-number { font-size: 10px; color: var(--muted); width: 16px; flex: 0 0 auto; }
+  .key-row .key-value { font-family: ui-monospace, Consolas, monospace; }
+  .key-row .key-delete:hover { color: var(--red); background: #faeded; }
+  .key-empty { color: var(--muted); font-size: 11px; padding: 12px 0; }
+  .source-config { display: grid; gap: 18px; }
+  .source-card.primary-source { grid-column: 1 / -1; }
+  .primary-source .source-config { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .source-addresses { display: grid; gap: 10px; align-content: start; }
+  .source-addresses label { display: grid; gap: 5px; font-size: 10px; color: var(--muted); }
+  .source-addresses input { width: 100%; padding: 8px 10px; font-size: 12px; }
+  .source-options { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+  .source-options label { display: flex; align-items: center; gap: 5px; }
+  .source-options input { accent-color: var(--green); }
+  .page-tools { display: flex; flex-wrap: wrap; gap: 7px; justify-content: flex-end; }
+  .transfer-help { margin: -13px 0 23px; font-size: 11px; color: var(--muted); }
+  .pipeline-engine { padding: 12px; border: 1px solid #cfe0d5; border-radius: 9px; background: var(--green-soft); margin-bottom: 10px; }
+  .pipeline-engine strong { font-size: 12px; color: var(--green); }
+  .pipeline-engine p { font-size: 10px; color: var(--muted); margin-top: 5px; }
+  .pipeline-join { text-align: center; color: var(--muted); font-size: 10px; margin: 8px 0; }
+  .pipeline-mode { display: grid; gap: 5px; font-size: 11px; color: var(--muted); margin-bottom: 14px; }
+  .pipeline-mode select { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); }
   .key-row input { width: 100%; padding: 8px 10px; font-size: 12px; }
   .icon-button { width: 30px; height: 32px; flex: 0 0 auto; padding: 0; background: transparent; color: #8a978b; display: grid; place-items: center; }
   .icon-button:hover:not(:disabled) { color: var(--green); background: var(--green-soft); }
@@ -173,6 +195,7 @@
     .page { padding: 28px 25px 120px; } .topbar { padding: 16px 25px; }
     .content-grid { grid-template-columns: minmax(0, 1fr) 270px; gap: 18px; }
     .source-grid { grid-template-columns: 1fr; } .source-description { min-height: auto; }
+    .primary-source .source-config { grid-template-columns: 1fr; }
     .save-bar { left: 184px; padding-left: 25px; padding-right: 25px; }
   }
   @media (max-width: 820px) {
@@ -189,7 +212,9 @@
     .stats { gap: 8px; margin-bottom: 25px; } .stat { padding: 13px 12px; border-radius: 10px; }
     .stat-value { font-size: 24px; } .stat-value.mode { font-size: 17px; margin-top: 12px; } .stat-help { font-size: 9px; }
     .content-grid { grid-template-columns: 1fr; gap: 25px; }
-    .source-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .source-grid { grid-template-columns: 1fr; gap: 12px; }
+    .primary-source .source-config { grid-template-columns: 1fr; }
+    .page-heading { flex-wrap: wrap; } .page-tools { justify-content: flex-start; }
     .source-card { padding: 14px 12px; } .source-name { font-size: 12px; }
     .source-logo { width: 27px; height: 27px; font-size: 16px; } .source-top { gap: 6px; }
     .source-description { min-height: 39px; font-size: 10px; }
@@ -260,7 +285,9 @@
       <div class="topbar-right"><span class="pill good" id="connection-status"><span class="dot"></span>配置已连接</span><span class="avatar" aria-hidden="true">NV</span><button class="btn quiet small mobile-logout" type="button" data-logout>退出</button></div>
     </header>
     <main class="page">
-      <div class="page-heading"><div><h1>搜索源管理<span style="color:#91aa86">.</span></h1><p>连接搜索服务，配置凭据，组织你的检索顺序。</p></div><button class="btn" id="refresh" type="button">↻ &nbsp; 刷新配置</button></div>
+      <div class="page-heading"><div><h1>搜索源管理<span style="color:#91aa86">.</span></h1><p>管理主引擎与补充来源的地址、密钥和调用方式。</p></div><div class="page-tools"><button class="btn" id="import" type="button">导入配置</button><button class="btn" id="export" type="button">导出配置</button><button class="btn" id="refresh" type="button">↻ 刷新配置</button></div></div>
+      <input id="import-file" type="file" accept=".json,application/json" hidden>
+      <p class="transfer-help">导出包含已保存的完整密钥，请妥善保管。导入仅支持下列渠道，预览后保存生效。</p>
       <div id="feedback" role="status" aria-live="polite" hidden></div>
       <div id="config-notice" class="notice" role="alert" hidden></div>
       <section class="stats" aria-label="当前草稿概览">
@@ -270,11 +297,14 @@
       </section>
       <div class="content-grid">
         <section aria-labelledby="sources-title" id="sources-section">
-          <div class="section-title"><div><h2 id="sources-title">搜索来源</h2><p>开关控制启用状态，保存后应用到服务。</p></div><span class="pill" id="source-count">7 个来源</span></div>
+          <div class="section-title"><div><h2 id="sources-title">搜索来源</h2><p>每个渠道可添加多个密钥，自动轮换。地址可使用兼容该渠道协议的中转。</p></div><span class="pill" id="source-count">8 个渠道</span></div>
           <fieldset id="source-fields" style="border:0;padding:0;margin:0;min-width:0"><legend hidden>来源配置</legend><div id="sources" class="source-grid"></div></fieldset>
         </section>
         <aside class="pipeline" id="pipeline" aria-labelledby="pipeline-title">
           <div class="pipeline-heading"><h2 id="pipeline-title">调用顺序</h2><span class="pill" id="order-mode">默认顺序</span></div>
+          <div class="pipeline-engine"><strong>Grok · 主引擎</strong><p id="grok-pipeline-status">读取配置中…</p><p>独立生成回答，与下方补充来源同时请求，不参与补充源排序。</p></div>
+          <div class="pipeline-join">∥ 同时发起</div>
+          <label class="pipeline-mode" for="parallel-sources">补充来源调用方式<select id="parallel-sources"><option value="false">顺序回退</option><option value="true">并行搜索</option></select></label>
           <p class="pipeline-description" id="pipeline-description">按顺序尝试，使用首个返回有效结果的来源。未就绪的来源自动跳过。</p>
           <div class="pipeline-start"><span>补充来源 / 搜索回退</span><span aria-hidden="true">↓</span></div>
           <ol id="source-order" class="order-list" aria-label="来源优先级"></ol>
@@ -297,6 +327,7 @@
   const API = { login: 'login', config: 'api/config' };
   const TOKEN_KEY = 'nv_token:' + new URL('.', location.href).pathname;
   const SOURCES = [
+    { id: 'grok', label: 'Grok', mark: '𝕏', color: '#23664f', bg: '#edf5ee', description: '主引擎生成带引用的回答；补充来源同时检索，供补充与失败回退使用。', caps: ['主引擎', 'Responses API', '多密钥轮换'], primary: true },
     { id: 'tavily', label: 'Tavily', mark: 't', color: '#4d728a', bg: '#eaf2f8', description: '为 AI 检索提供结构化结果与网页原文。', caps: ['搜索', '原文提取', '站点地图'] },
     { id: 'exa', label: 'Exa', mark: 'e', color: '#7969a0', bg: '#f0edf8', description: '通过语义理解，发现与问题相关的内容。', caps: ['语义搜索', '原文提取'] },
     { id: 'tinyfish', label: 'TinyFish', mark: '≈', color: '#3c968f', bg: '#e9f5f1', description: '网页搜索与动态页面内容提取。', caps: ['搜索', '动态网页'] },
@@ -306,7 +337,14 @@
     { id: 'firecrawl', label: 'Firecrawl', mark: 'f', color: '#b86f45', bg: '#fcf0e7', description: '网页抓取与内容提取的补充来源。', caps: ['搜索', '原文提取'] },
   ];
   const $ = id => document.getElementById(id);
-  const ui = { current: null, drafts: new Map(), order: [], customOrder: false, busy: false, authMode: 'password', token: '', cards: new Map() };
+  const ui = { current: null, drafts: new Map(), order: [], customOrder: false, busy: false, authMode: 'password', token: '', cards: new Map(), options: {}, nextKey: 0 };
+  const OPTION_FIELDS = ['grok_model', 'web_search_enabled', 'x_search_enabled', 'parallel_sources'];
+  const KEYLESS_MODES = ['tavily', 'exa', 'firecrawl'];
+  const URL_LABELS = { grok_api_url: 'API 地址', tavily_api_url: 'API 地址', exa_api_url: 'API 地址', tinyfish_search_api_url: '搜索 API 地址', tinyfish_fetch_api_url: '提取 API 地址', serper_api_url: 'API 地址', firecrawl_api_url: 'API 地址', html_endpoint: 'HTML 搜索地址（固定）', lite_endpoint: 'Lite 搜索地址（固定）', search_endpoint: '搜索地址（固定）' };
+  const MAX_KEYS = 32;
+  const editableUrl = field => field.endsWith('_api_url');
+  URL_LABELS.mcp_endpoint = '匿名 MCP 地址（固定）';
+  const MAX_TRANSFER_BYTES = 2 * 1024 * 1024;
   try { ui.token = sessionStorage.getItem(TOKEN_KEY) || ''; } catch (_) { /* Login still works without browser storage. */ }
 
   function storeToken(value) {
@@ -355,10 +393,11 @@
           400: '配置内容有误，请检查后重试。', 401: '登录凭据无效或已过期，请重新登录。',
           403: '当前页面来源未获允许，请检查服务的访问配置。',
           404: '未找到配置接口，请确认访问地址及配置页面已启用。',
+          409: '配置已被其他页面修改，请刷新后重新编辑。',
           413: '提交的内容过长，请缩短密钥列表。', 429: '服务正忙，请稍后重试。',
         };
         const detail = data && (data.error || (data.errors && data.errors.map(item => item.message).join('；')));
-        const error = new Error(detail || messages[resp.status] || '服务暂时无法完成请求（' + resp.status + '）。');
+        const error = new Error(resp.status === 409 ? messages[409] : detail || messages[resp.status] || '服务暂时无法完成请求（' + resp.status + '）。');
         error.status = resp.status;
         error.savedConfig = data && data.saved === true ? data.config : null;
         throw error;
@@ -460,25 +499,40 @@
     const body = {};
     for (const [id, draft] of ui.drafts) {
       const previous = ui.current.sources[id];
-      if (!ui.current.env_overrides[id + '_enabled'] && draft.enabled !== previous.enabled) body[id + '_enabled'] = draft.enabled;
-      if (!ui.current.env_overrides[id + '_api_key']) {
-        if (draft.clear) body[id + '_api_key'] = '';
-        else if (draft.key.trim()) body[id + '_api_key'] = draft.key.trim();
+      if (id !== 'grok' && draft.enabled !== previous.enabled) body[id + '_enabled'] = draft.enabled;
+      if (KEYLESS_MODES.includes(id) && draft.keyless !== previous.keyless) body[id + '_keyless'] = draft.keyless;
+      if (keysChanged(id)) {
+        (body.api_keys ||= {})[id] = draft.keys.map(key => key.id ? { id: key.id } : { value: key.value.trim() });
       }
+      if (!SOURCES.find(source => source.id === id).keyless) {
+        for (const [field, value] of Object.entries(draft.urls)) {
+          if (editableUrl(field) && value.trim() !== previous.api_urls[field]) (body.api_urls ||= {})[field] = value.trim();
+        }
+      }
+    }
+    for (const field of OPTION_FIELDS) {
+      const value = typeof ui.options[field] === 'string' ? ui.options[field].trim() : ui.options[field];
+      if (value !== ui.current[field]) body[field] = value;
     }
     const order = ui.customOrder ? ui.order : [];
     if (!ui.current.env_overrides.source_providers && JSON.stringify(order) !== JSON.stringify(ui.current.source_providers)) body.source_providers = order.slice();
     return body;
   }
 
+  function keysChanged(id) {
+    const keys = ui.drafts.get(id).keys;
+    const previous = ui.current.sources[id].api_keys;
+    return keys.length !== previous.length || keys.some((key, index) => !key.id || key.id !== previous[index].id);
+  }
+
   function sourceState(id) {
     const source = ui.current.sources[id];
     const draft = ui.drafts.get(id);
     if (!source || !draft) return { active: false, text: '不可用', tone: '' };
-    const hasKey = !!draft.key.trim() || (!draft.clear && source.api_key === 'set');
+    const hasKey = draft.keys.some(key => key.id || key.value.trim());
     if (!draft.enabled) return { active: false, text: '已停用', tone: '' };
-    if (!hasKey && !source.keyless) return { active: false, text: '待配置密钥', tone: 'warn' };
-    if (!ui.order.includes(id)) return { active: false, text: '未参与调用', tone: '' };
+    if (!hasKey && !draft.keyless) return { active: false, text: '待配置密钥', tone: 'warn' };
+    if (id !== 'grok' && !ui.order.includes(id)) return { active: false, text: '未参与调用', tone: '' };
     return { active: true, text: hasKey ? '已就绪' : '免密钥 · 已就绪', tone: 'good' };
   }
 
@@ -493,34 +547,47 @@
     $('save').disabled = ui.busy || !changes || !ui.current.config_file || ui.current.config_file_state === 'rejected';
     $('discard').disabled = ui.busy || !changes;
     $('refresh').disabled = ui.busy;
+    $('import').disabled = ui.busy;
+    $('export').disabled = ui.busy || changes > 0 || ui.current.config_file_state === 'rejected';
+    $('export').title = changes ? '先保存或撤销更改，再导出当前配置' : '导出所有渠道的地址和完整密钥';
+    $('parallel-sources').disabled = ui.busy;
     $('source-fields').disabled = ui.busy;
     document.querySelectorAll('[data-logout]').forEach(button => { button.disabled = ui.busy; });
     $('reset-order').disabled = ui.busy || !!ui.current.env_overrides.source_providers || !ui.customOrder;
     for (const [id, card] of ui.cards) {
       const draft = ui.drafts.get(id);
-      card.root.classList.toggle('is-edited', draft.enabled !== ui.current.sources[id].enabled || draft.clear || !!draft.key.trim());
+      const previous = ui.current.sources[id];
+      card.root.classList.toggle('is-edited', draft.enabled !== previous.enabled || draft.keyless !== previous.keyless || keysChanged(id) || Object.entries(draft.urls).some(([field, value]) => value.trim() !== previous.api_urls[field]) || (id === 'grok' && OPTION_FIELDS.slice(0, 3).some(field => ui.options[field] !== ui.current[field])));
       const state = sourceState(id);
       card.status.textContent = state.text;
       card.status.className = 'source-status ' + state.tone;
       if (card.keyStatus) {
-        card.keyStatus.textContent = ui.current.env_overrides[id + '_api_key'] ? '环境变量管理'
-          : draft.clear ? '将清除' : draft.key.trim() ? '待更新' : ui.current.sources[id].api_key === 'set' ? '已配置' : '未配置';
-        card.clear.textContent = draft.clear ? '撤销清除' : '清除密钥';
-        card.clear.disabled = !!ui.current.env_overrides[id + '_api_key'] || (!draft.clear && !draft.key.trim() && ui.current.sources[id].api_key !== 'set');
+        card.keyStatus.textContent = draft.keys.length + ' 个密钥' + (keysChanged(id) ? ' · 待保存' : ui.current.env_defaults[id + '_api_key'] ? ' · 来自环境变量，可编辑' : '');
+        card.add.disabled = draft.keys.length >= MAX_KEYS;
       }
     }
+    const grok = sourceState('grok');
+    $('grok-pipeline-status').textContent = (ui.options.grok_model || '未配置模型') + ' · ' + grok.text;
+    $('stat-mode').textContent = ui.options.parallel_sources ? '并行搜索' : '顺序回退';
+    $('stat-mode-help').textContent = '补充来源 · ' + (ui.options.parallel_sources ? '同时请求并合并结果' : '首个有效来源优先');
+    $('pipeline-description').textContent = ui.options.parallel_sources
+      ? '下列来源同时查询，按这里的顺序合并结果。Grok 独立生成回答。'
+      : '下列来源按顺序回退，首个有效来源优先。Grok 独立生成回答。';
   }
 
   function renderSettings(data) {
-    if (!data.sources || !data.env_overrides || !Array.isArray(data.source_providers) || !Array.isArray(data.default_source_providers)) throw new Error('配置数据不完整，请刷新页面或确认服务版本。');
+    if (!data.sources || !data.sources.grok || !data.env_defaults || !data.revision || !Array.isArray(data.source_providers) || !Array.isArray(data.default_source_providers) || SOURCES.some(meta => !Array.isArray(data.sources[meta.id]?.api_keys) || !data.sources[meta.id]?.api_urls)) throw new Error('配置数据不完整，请刷新页面或确认服务版本。');
     ui.current = data;
     ui.customOrder = data.source_providers.length > 0;
     ui.order = (ui.customOrder ? data.source_providers : data.default_source_providers).slice();
     ui.drafts.clear();
     ui.cards.clear();
     for (const meta of SOURCES) {
-      if (data.sources[meta.id]) ui.drafts.set(meta.id, { enabled: data.sources[meta.id].enabled, key: '', clear: false });
+      const source = data.sources[meta.id];
+      if (source) ui.drafts.set(meta.id, { enabled: source.enabled, keyless: source.keyless, keys: source.api_keys.map(key => ({ ...key, uid: ++ui.nextKey })), urls: { ...source.api_urls } });
     }
+    ui.options = Object.fromEntries(OPTION_FIELDS.map(field => [field, data[field]]));
+    $('parallel-sources').value = String(data.parallel_sources);
     $('stat-mode').textContent = data.parallel_sources ? '并行搜索' : '顺序回退';
     $('stat-mode-help').textContent = data.parallel_sources ? '同时请求，合并返回的结果' : '使用首个返回有效结果的来源';
     $('pipeline-description').textContent = data.parallel_sources
@@ -544,91 +611,177 @@
     $('connection-status').textContent = '配置已连接';
   }
 
+  function optionToggle(label, checked, change) {
+    const wrapper = element('label');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = checked;
+    input.addEventListener('change', () => { change(input.checked); updateSummary(); renderOrder(); });
+    wrapper.append(input, document.createTextNode(label));
+    return wrapper;
+  }
+
   function renderSource(meta) {
     const id = meta.id;
-    const source = ui.current.sources[id];
     const draft = ui.drafts.get(id);
-    const card = element('article', 'source-card');
+    const card = element('article', 'source-card' + (meta.primary ? ' primary-source' : ''));
     card.id = 'card-' + id;
     const top = element('div', 'source-top');
     top.append(sourceLogo(meta), element('h3', 'source-name', meta.label));
-    const toggle = element('label', 'switch');
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = draft.enabled;
-    checkbox.disabled = !!ui.current.env_overrides[id + '_enabled'];
-    checkbox.setAttribute('aria-label', '启用 ' + meta.label);
-    if (checkbox.disabled) toggle.title = '启用状态由环境变量管理';
-    checkbox.addEventListener('change', () => { draft.enabled = checkbox.checked; updateSummary(); renderOrder(); });
-    toggle.append(checkbox, element('span', 'switch-track'));
-    top.append(toggle);
+    if (meta.primary) {
+      top.append(element('span', 'pill good', '独立主引擎'));
+    } else {
+      const toggle = element('label', 'switch');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = draft.enabled;
+      checkbox.setAttribute('aria-label', '启用 ' + meta.label);
+      checkbox.addEventListener('change', () => { draft.enabled = checkbox.checked; updateSummary(); renderOrder(); });
+      toggle.append(checkbox, element('span', 'switch-track'));
+      top.append(toggle);
+    }
     card.append(top, element('p', 'source-description', meta.description));
     const tags = element('div', 'source-tags');
     meta.caps.forEach(cap => tags.append(element('span', 'capability', cap)));
-    if (checkbox.disabled) tags.append(element('span', 'capability', '开关由环境变量管理'));
     card.append(tags);
     const refs = { root: card };
-    if (meta.keyless) {
-      card.append(element('div', 'keyless-note', '无需配置密钥，启用即可参与搜索。'));
-    } else {
-      const labelRow = element('div', 'key-label');
-      const label = element('label', '', 'API 密钥');
-      label.htmlFor = 'key-' + id;
-      refs.keyStatus = element('span');
-      labelRow.append(label, refs.keyStatus);
-      const row = element('div', 'key-row');
+    const settings = element('div', 'source-config');
+    const addresses = element('div', 'source-addresses');
+    for (const [field, value] of Object.entries(draft.urls)) {
+      const label = element('label', '', URL_LABELS[field] || field);
       const input = document.createElement('input');
-      input.id = 'key-' + id;
-      input.type = 'password';
-      input.autocomplete = 'off';
+      input.type = 'url';
+      input.value = value;
+      input.readOnly = !editableUrl(field);
+      input.maxLength = 2048;
       input.spellcheck = false;
-      input.maxLength = 4096;
-      input.disabled = !!ui.current.env_overrides[id + '_api_key'];
-      input.placeholder = source.api_key === 'set' ? '已配置 · 输入以替换' : '输入 API 密钥';
-      input.setAttribute('aria-label', meta.label + ' API 密钥');
-      input.addEventListener('input', () => {
-        draft.key = input.value;
-        // A typed replacement must cancel an earlier Clear action.
-        if (draft.key) draft.clear = false;
-        updateSummary();
-        renderOrder();
-      });
-      const reveal = element('button', 'icon-button');
-      reveal.type = 'button';
-      reveal.disabled = input.disabled;
-      reveal.setAttribute('aria-label', '显示 ' + meta.label + ' 输入的密钥');
-      reveal.setAttribute('aria-pressed', 'false');
-      reveal.title = '显示或隐藏输入的密钥';
-      reveal.append(svgIcon('eye-icon'));
-      reveal.addEventListener('click', () => {
-        const visible = input.type === 'password';
-        input.type = visible ? 'text' : 'password';
-        reveal.setAttribute('aria-pressed', String(visible));
-        reveal.setAttribute('aria-label', (visible ? '隐藏 ' : '显示 ') + meta.label + ' 输入的密钥');
-      });
-      row.append(input, reveal);
-      card.append(labelRow, row);
-      refs.clear = element('button', 'clear-button', '清除密钥');
-      refs.clear.type = 'button';
-      refs.clear.addEventListener('click', () => {
-        draft.clear = !draft.clear;
-        draft.key = '';
-        input.value = '';
-        input.type = 'password';
-        reveal.setAttribute('aria-pressed', 'false');
-        reveal.setAttribute('aria-label', '显示 ' + meta.label + ' 输入的密钥');
-        input.placeholder = draft.clear ? '输入新密钥可取消清除' : source.api_key === 'set' ? '已配置 · 输入以替换' : '输入 API 密钥';
-        updateSummary();
-        renderOrder();
-      });
+      input.setAttribute('aria-label', meta.label + ' ' + (URL_LABELS[field] || field));
+      input.addEventListener('input', () => { draft.urls[field] = input.value; updateSummary(); });
+      label.append(input);
+      addresses.append(label);
     }
+    if (meta.primary) {
+      const label = element('label', '', '模型');
+      const model = document.createElement('input');
+      model.value = ui.options.grok_model;
+      model.maxLength = 256;
+      model.setAttribute('aria-label', 'Grok 模型');
+      model.addEventListener('input', () => { ui.options.grok_model = model.value; updateSummary(); });
+      label.append(model);
+      const options = element('div', 'source-options');
+      options.append(
+        optionToggle('网页搜索', ui.options.web_search_enabled, value => { ui.options.web_search_enabled = value; }),
+        optionToggle('X / Twitter 搜索', ui.options.x_search_enabled, value => { ui.options.x_search_enabled = value; }),
+      );
+      addresses.append(label, options);
+    }
+    settings.append(addresses);
+    if (meta.keyless) {
+      settings.append(element('div', 'keyless-note', '无需配置密钥，使用内置网页解析协议。'));
+    } else {
+      const keys = element('div');
+      const labelRow = element('div', 'key-label');
+      refs.keyStatus = element('span');
+      labelRow.append(element('span', '', 'API 密钥'), refs.keyStatus);
+      refs.keyList = element('div', 'key-list');
+      refs.add = element('button', 'btn small', '+ 添加密钥');
+      refs.add.type = 'button';
+      refs.add.setAttribute('aria-label', '添加 ' + meta.label + ' 密钥');
+      refs.add.addEventListener('click', () => {
+        if (ui.busy || draft.keys.length >= MAX_KEYS) return;
+        const key = { value: '', uid: ++ui.nextKey };
+        draft.keys.push(key);
+        renderKeys(meta, refs);
+        updateSummary();
+        $('key-' + key.uid).focus();
+      });
+      keys.append(labelRow, refs.keyList, refs.add);
+      if (KEYLESS_MODES.includes(id)) {
+        const options = element('div', 'source-options');
+        options.style.marginTop = '10px';
+        options.append(optionToggle('无密钥时使用匿名模式', draft.keyless, value => { draft.keyless = value; }));
+        keys.append(options);
+      }
+      settings.append(keys);
+      renderKeys(meta, refs);
+    }
+    card.append(settings);
     const bottom = element('div', 'source-bottom');
     refs.status = element('span', 'source-status');
     bottom.append(refs.status);
-    if (refs.clear) bottom.append(refs.clear);
+    if (!meta.keyless) bottom.append(element('span', 'muted', '保存后轮换使用 · 最多 ' + MAX_KEYS + ' 个'));
     card.append(bottom);
     ui.cards.set(id, refs);
     return card;
+  }
+
+  function renderKeys(meta, refs) {
+    const draft = ui.drafts.get(meta.id);
+    const fragment = document.createDocumentFragment();
+    if (!draft.keys.length) fragment.append(element('p', 'key-empty', '暂无密钥，点击下方按钮添加。'));
+    draft.keys.forEach((key, index) => {
+      const row = element('div', 'key-row');
+      const input = document.createElement('input');
+      input.id = 'key-' + key.uid;
+      input.className = 'key-value';
+      input.type = key.id ? 'text' : 'password';
+      input.readOnly = !!key.id;
+      input.value = key.id ? key.masked : key.value;
+      input.placeholder = '输入新密钥';
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.maxLength = 4096;
+      input.setAttribute('aria-label', meta.label + ' 密钥 ' + (index + 1));
+      input.addEventListener('input', () => { key.value = input.value; updateSummary(); renderOrder(); });
+      const reveal = element('button', 'icon-button');
+      reveal.type = 'button';
+      reveal.setAttribute('aria-pressed', 'false');
+      const label = meta.label + ' 密钥 ' + (index + 1);
+      reveal.setAttribute('aria-label', '查看 ' + label);
+      reveal.title = '查看完整密钥';
+      reveal.append(svgIcon('eye-icon'));
+      let visible = false;
+      reveal.addEventListener('click', async () => {
+        if (visible) {
+          input.value = key.id ? key.masked : key.value;
+          input.type = key.id ? 'text' : 'password';
+          visible = false;
+        } else {
+          const snapshot = ui.current;
+          reveal.disabled = true;
+          try {
+            const value = key.id
+              ? (await request(API.config + '/keys/' + encodeURIComponent(meta.id) + '/' + encodeURIComponent(key.id))).value
+              : key.value;
+            if (snapshot !== ui.current || !input.isConnected) return;
+            input.value = value;
+            input.type = 'text';
+            visible = true;
+          } catch (error) {
+            if (snapshot !== ui.current) return;
+            if (error.status === 401) showLogin(error.message);
+            else feedback(error.message, 'error');
+          } finally { reveal.disabled = false; }
+        }
+        reveal.setAttribute('aria-pressed', String(visible));
+        reveal.setAttribute('aria-label', (visible ? '隐藏 ' : '查看 ') + label);
+        reveal.title = visible ? '隐藏密钥' : '查看完整密钥';
+      });
+      const remove = element('button', 'icon-button key-delete', '×');
+      remove.type = 'button';
+      remove.title = '删除密钥，保存后生效';
+      remove.setAttribute('aria-label', '删除 ' + label);
+      remove.addEventListener('click', () => {
+        draft.keys.splice(draft.keys.indexOf(key), 1);
+        renderKeys(meta, refs);
+        updateSummary();
+        renderOrder();
+        refs.add.focus();
+      });
+      row.append(element('span', 'key-number', String(index + 1).padStart(2, '0')), input, reveal, remove);
+      fragment.append(row);
+    });
+    refs.keyList.replaceChildren(fragment);
   }
 
   function renderOrder(focusId) {
@@ -676,7 +829,7 @@
     $('source-order').replaceChildren(fragment);
     const add = document.createDocumentFragment();
     for (const meta of SOURCES) {
-      if (ui.order.includes(meta.id) || !ui.drafts.has(meta.id)) continue;
+      if (meta.primary || ui.order.includes(meta.id) || !ui.drafts.has(meta.id)) continue;
       const button = element('button', 'btn small', '+ ' + meta.label);
       button.id = 'add-' + meta.id;
       button.type = 'button';
@@ -733,6 +886,8 @@
     if (ui.busy || !ui.current) return;
     const body = patch();
     if (!Object.keys(body).length) return;
+    try { validateDrafts(); } catch (error) { feedback(error.message, 'error'); return; }
+    body.revision = ui.current.revision;
     ui.busy = true;
     updateSummary();
     renderOrder();
@@ -755,11 +910,135 @@
     } finally { ui.busy = false; updateSummary(); renderOrder(); }
   }
 
+  function validateUrl(value) {
+    if (typeof value !== 'string' || new TextEncoder().encode(value).length > 2048 || /[\u0000-\u001f\u007f-\u009f]/.test(value)) throw new Error('地址格式无效。');
+    let url;
+    try { url = new URL(value.trim()); } catch (_) { throw new Error('请输入完整的 HTTP 或 HTTPS 地址。'); }
+    if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password || url.search || url.hash) throw new Error('地址必须使用 HTTP / HTTPS，且不能包含账号、密码、查询参数或片段。');
+  }
+
+  function validateKey(value) {
+    if (typeof value !== 'string' || !value.trim() || new TextEncoder().encode(value).length > 4096 || /[,\u0000-\u001f\u007f-\u009f]/.test(value)) throw new Error('每行填写一个非空密钥，最长 4096 字节，不能包含逗号或控制字符。');
+  }
+
+  function validateDrafts() {
+    for (const [id, draft] of ui.drafts) {
+      if (draft.keys.length > MAX_KEYS) throw new Error(id + ' 最多支持 ' + MAX_KEYS + ' 个密钥。');
+      for (const key of draft.keys) if (!key.id) validateKey(key.value);
+      for (const value of Object.values(draft.urls)) validateUrl(value);
+    }
+    const model = ui.options.grok_model;
+    if (!model.trim() || new TextEncoder().encode(model).length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(model)) throw new Error('请填写有效的 Grok 模型名称（最长 256 字节）。');
+  }
+
+  function onlyFields(object, allowed, label) {
+    if (!object || typeof object !== 'object' || Array.isArray(object)) throw new Error(label + ' 格式不正确。');
+    if (Object.keys(object).some(field => !allowed.includes(field))) throw new Error(label + ' 包含不支持的字段，请使用本页面导出的格式。');
+  }
+
+  function prepareImport(data) {
+    onlyFields(data, ['format', 'version', 'sources', 'source_providers', ...OPTION_FIELDS], '配置文件');
+    if (data.format !== 'nova-veil-search/sources' || data.version !== 1) throw new Error('不支持此文件格式或版本，请选择 Nova Veil Search 导出的 JSON 文件。');
+    onlyFields(data.sources, SOURCES.map(meta => meta.id), '搜索来源');
+    if (!Object.keys(data.sources).length) throw new Error('文件中没有可导入的搜索源。');
+    const drafts = new Map(ui.drafts);
+    const options = { ...ui.options };
+    for (const [id, source] of Object.entries(data.sources)) {
+      const meta = SOURCES.find(item => item.id === id);
+      onlyFields(source, ['enabled', 'keyless', 'api_urls', 'api_keys'], meta.label);
+      const previous = ui.drafts.get(id);
+      const urls = { ...previous.urls };
+      onlyFields(source.api_urls, Object.keys(urls), meta.label + ' 地址');
+      for (const [field, value] of Object.entries(source.api_urls)) {
+        validateUrl(value);
+        if (!editableUrl(field) && value.trim() !== ui.current.sources[id].api_urls[field]) throw new Error(meta.label + ' 的内置地址不能替换为其他服务。');
+        urls[field] = value.trim();
+      }
+      if (!Array.isArray(source.api_keys) || source.api_keys.length > MAX_KEYS || (meta.keyless && source.api_keys.length)) throw new Error(meta.label + ' 的密钥列表无效。');
+      const values = [];
+      for (const value of source.api_keys) {
+        validateKey(value);
+        if (!values.includes(value.trim())) values.push(value.trim());
+      }
+      for (const field of ['enabled', 'keyless']) {
+        if (field in source && typeof source[field] !== 'boolean') throw new Error(meta.label + ' 的 ' + field + ' 必须为布尔值。');
+      }
+      if (meta.primary && source.enabled === false) throw new Error('Grok 是独立主引擎，当前不支持通过导入停用。');
+      if ('keyless' in source && !KEYLESS_MODES.includes(id) && source.keyless !== !!meta.keyless) throw new Error(meta.label + ' 不支持该匿名模式设置。');
+      drafts.set(id, { enabled: source.enabled ?? previous.enabled, keyless: source.keyless ?? previous.keyless, urls, keys: values.map(value => ({ value, uid: ++ui.nextKey })) });
+    }
+    for (const field of OPTION_FIELDS) {
+      if (!(field in data)) continue;
+      if (typeof data[field] !== typeof ui.options[field]) throw new Error(field + ' 的格式不正确。');
+      options[field] = data[field];
+    }
+    if (!options.grok_model.trim() || new TextEncoder().encode(options.grok_model).length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(options.grok_model)) throw new Error('Grok 模型名称无效。');
+    let order = ui.order.slice();
+    let customOrder = ui.customOrder;
+    if ('source_providers' in data) {
+      if (!Array.isArray(data.source_providers) || data.source_providers.some(id => !SOURCES.some(meta => meta.id === id && !meta.primary)) || new Set(data.source_providers).size !== data.source_providers.length) throw new Error('调用顺序只能包含现有补充来源且不能重复。Grok 不参与补充源排序。');
+      customOrder = data.source_providers.length > 0;
+      order = (customOrder ? data.source_providers : ui.current.default_source_providers).slice();
+    }
+    return { drafts, options, order, customOrder, count: Object.keys(data.sources).length };
+  }
+
+  async function importConfig(event) {
+    const file = event.target.files[0];
+    event.target.value = '';
+    if (!file || ui.busy || !ui.current) return;
+    if (file.size > MAX_TRANSFER_BYTES) { feedback('导入文件不能超过 2 MiB。', 'error'); return; }
+    ui.busy = true;
+    updateSummary();
+    renderOrder();
+    try {
+      let data;
+      try { data = JSON.parse(await file.text()); } catch (_) { throw new Error('无法读取 JSON 配置文件。'); }
+      const imported = prepareImport(data);
+      ui.drafts = imported.drafts;
+      ui.options = imported.options;
+      ui.order = imported.order;
+      ui.customOrder = imported.customOrder;
+      ui.cards.clear();
+      $('sources').replaceChildren(...SOURCES.map(renderSource));
+      $('parallel-sources').value = String(ui.options.parallel_sources);
+      feedback('已导入 ' + imported.count + ' 个渠道到草稿。请核对地址、密钥数量和调用方式，点击「保存更改」后生效。');
+    } catch (error) { feedback(error.message + ' 原有编辑内容已保留。', 'error'); }
+    finally { ui.busy = false; updateSummary(); renderOrder(); }
+  }
+
+  async function exportConfig() {
+    if (ui.busy || !ui.current || Object.keys(patch()).length) return;
+    ui.busy = true;
+    updateSummary();
+    renderOrder();
+    try {
+      const data = await request(API.config + '/export');
+      const blob = new Blob([JSON.stringify(data, null, 2) + '\n'], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'nova-veil-search-sources-' + new Date().toISOString().slice(0, 10) + '.json';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      feedback('已导出所有渠道的地址与完整密钥，请妥善保管文件。');
+    } catch (error) {
+      if (error.status === 401) showLogin(error.message);
+      else feedback(error.message, 'error');
+    } finally { ui.busy = false; updateSummary(); renderOrder(); }
+  }
+
   $('login-form').addEventListener('submit', login);
   $('auth-password').addEventListener('click', () => setAuthMode('password'));
   $('auth-token').addEventListener('click', () => setAuthMode('token'));
   $('save').addEventListener('click', save);
   $('refresh').addEventListener('click', () => loadConfig());
+  $('import').addEventListener('click', () => { if (!ui.busy) $('import-file').click(); });
+  $('import-file').addEventListener('change', importConfig);
+  $('export').addEventListener('click', exportConfig);
+  $('parallel-sources').addEventListener('change', event => { ui.options.parallel_sources = event.target.value === 'true'; updateSummary(); renderOrder(); });
   $('discard').addEventListener('click', () => {
     if (!ui.busy && confirm('撤销本次尚未保存的更改？')) { renderSettings(ui.current); feedback('已撤销未保存的更改。'); }
   });

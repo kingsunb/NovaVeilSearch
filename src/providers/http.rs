@@ -355,6 +355,16 @@ impl HttpClients {
                 }
             }
         }
+        if let Some(template) = proxy_grok.filter(|template| has_account_placeholder(template)) {
+            for key in split_keys(grok_key) {
+                if let Some(resolved) = resolve_proxy_template(template, &account_alias("grok", &key)) {
+                    keyed_overrides.insert(
+                        ("grok", key),
+                        build_one(timeout, Some(&resolved), restricted),
+                    );
+                }
+            }
+        }
         proxy_startup_summary(
             proxy_key,
             placeholder_key,

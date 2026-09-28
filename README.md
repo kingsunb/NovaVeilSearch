@@ -277,7 +277,7 @@ Tired of duplicating `env` blocks across clients? Run `nova-veil-search --init` 
 | 2 | `$HOME/.config/nova-veil-search/config.toml` (Unix / macOS / Git Bash) |
 | 3 | `%USERPROFILE%\.config\nova-veil-search\config.toml` (native Windows) |
 
-**Precedence**: per‑client `env` **>** config file **>** built‑in defaults. File keys are lowercase `snake_case` (env `GROK_SEARCH_MODEL` → file `grok_model`). Unknown keys are rejected. Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+**Precedence (stdio)**: per‑client `env` **>** config file **>** built‑in defaults. With the HTTP settings UI enabled, saved search-source settings (including Grok) instead take precedence over environment defaults. File keys are lowercase `snake_case` (env `GROK_SEARCH_MODEL` → file `grok_model`). Unknown keys are rejected. Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ---
 
@@ -329,8 +329,19 @@ curl -sX POST https://<your-host>/nova-veil-search/login \
 `/api/config` are **off by default**: the server stays a pure backend (`/mcp`,
 `/messages`, `/login`) with no frontend routes and no per-request `config.toml`
 read. Set `NOVA_CONFIG_UI=true` (also `1`/`yes`, case-insensitive) to serve the
-embedded settings SPA and let each request honor `config.toml` edits (env
-> file > defaults). Off, `/` and `/api/config` return `404`.
+embedded settings SPA. Saved source settings use **file > env > defaults** and
+reload immediately; other settings retain environment precedence. Off, frontend
+routes return `404`.
+
+The page manages multiple keys per channel (Grok, Tavily, Exa, TinyFish, Serper,
+Firecrawl), with individual reveal/add/delete actions and automatic rotation.
+It also edits provider URLs, Grok model/search options, source order and parallel
+mode. Existing environment keys are editable defaults; clearing a saved list
+keeps them disabled. JSON import/export transfers URLs and full keys for existing
+channels, with imports staged for review before saving. Custom URLs must speak
+the selected provider's protocol; new provider types need an adapter. Grok is
+shown as the independent primary engine that runs concurrently with the sorted
+supplemental sources. See [settings configuration](docs/CONFIGURATION.md#settingsconfig-frontend-opt-in-nova_config_ui).
 
 A missing required key returns `401` (fail‑closed); OAuth is rejected on this transport
 (stdio only). The operator sets the Grok‑compatible gateway via `GROK_SEARCH_URL`
@@ -380,7 +391,9 @@ contract, authentication, and retention limits.
 
 ### Rotating a key
 
-Keys live on the server, so rotate there (update the provider key in the server environment).
+Keys live on the server. With `NOVA_CONFIG_UI=true`, manage the saved key lists
+in the settings page; they override environment defaults. Without the UI,
+update the provider keys in the server environment and restart the service.
 Rotate `GROK_MCP_API_TOKEN` whenever it has leaked — every client then updates only its
 `Authorization` header; previously issued `/login` session tokens also stop matching the master
 token but any still-valid sessions must be cleared by restarting the server (sessions are

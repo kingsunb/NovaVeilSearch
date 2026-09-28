@@ -75,10 +75,63 @@ The embedded settings SPA (`GET /`) and the config read/write API (`GET/PUT
 `/api/config`) are **off by default**: the server stays a pure backend
 (`/mcp`, `/messages`, `/login`) with no frontend routes and no per-request
 `config.toml` read. Set `NOVA_CONFIG_UI=true` (also `1`/`yes`, case-insensitive)
-to enable both. ON serves `GET /` and lets each request honor `config.toml`
-edits with the usual precedence (env > file > defaults); OFF returns `404` on
-`/` and `/api/config` and keeps request config env-only (zero per-request
-disk I/O).
+to enable both. With the UI enabled, editable search settings use **file > env >
+defaults**: Grok keys, URL, model and search flags; provider keys, URLs, switches
+and anonymous modes; source order and parallel mode. Other settings retain
+**env > file > defaults**. Saved source fields take effect immediately; external
+file edits are checked at most once a second. OFF returns `404` on all frontend
+routes and keeps request config env-only. Local stdio precedence is unchanged.
+
+The page manages Grok, Tavily, Exa, TinyFish, Serper and Firecrawl key lists
+(up to 32 keys per channel). Keys rotate between requests and fail over on
+key-scoped HTTP errors. Existing environment keys appear as editable defaults;
+deleting the last key writes an explicit empty string, preventing an old env
+value from becoming active again. DuckDuckGo and Bing use fixed scraping
+endpoints and do not accept keys.
+
+**Grok is the independent primary engine.** It runs concurrently with the
+supplemental source pipeline. The displayed source order controls that pipeline's
+sequential fallback order, or merge order in parallel mode. Grok is shown
+separately and cannot be moved into `source_providers`.
+
+**Import/export:** export downloads version 1 JSON (`format:
+"nova-veil-search/sources"`) containing all current source URLs and full keys,
+source switches, anonymous modes, order, parallel mode, and Grok model/search
+flags. Protect this file as you would the keys. The importer accepts only known
+channels; it stages changes for review before **Save** writes them. A partial
+file can contain just the channels to replace; omitted channels remain unchanged.
+Each included channel supplies `api_urls` (field-to-URL object) and `api_keys`
+(string array); `enabled` and `keyless` are optional. For example:
+
+```json
+{
+  "format": "nova-veil-search/sources",
+  "version": 1,
+  "sources": {
+    "tavily": {
+      "enabled": true,
+      "api_urls": { "tavily_api_url": "https://api.tavily.com" },
+      "api_keys": ["tvly-example-a", "tvly-example-b"]
+    }
+  }
+}
+```
+
+Custom URLs must speak the selected channel's existing protocol, including its
+auth headers, paths and response format. Arbitrary new provider names are not
+supported; they need a provider adapter. Fixed DuckDuckGo/Bing endpoints can be
+round-tripped in backups but cannot be replaced.
+
+The authenticated API exposes masked entries through `GET /api/config`, explicit
+single-key reveal through `GET /api/config/keys/{source}/{id}`, and full backup
+through `GET /api/config/export`. These responses use `Cache-Control: no-store`.
+`PUT /api/config` accepts `api_keys: {provider: [{id: "existing-id"},
+{value: "new-key"}]}`, `api_urls: {field: "https://..."}`, and the editable
+settings. An empty key array deletes all keys for that channel. Include the
+`revision` returned by GET to detect stale edits (HTTP 409); the page does this
+automatically. Imports go through the same validated PUT when saved. Request
+bodies and import files are limited to 2 MiB. Keys must be nonempty, at most
+4096 UTF-8 bytes, and contain no commas or control characters.
 
 ## Grok Responses
 

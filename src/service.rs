@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::cache::{QueryResultCache, SourceCache};
 use crate::config::{AuthMode, Config};
-use crate::credentials::{OAuthCredential, StaticApiKeyCredential};
+use crate::credentials::OAuthCredential;
 use crate::error::{NovaVeilSearchError, Result};
 use crate::model::search::{
     ContentBlock, SearchFilters, SearchMessage, SearchRequest, SearchResponse, SearchTool,
@@ -589,35 +589,38 @@ fn build_providers(
 
     let ai: Arc<dyn AiProvider> = match config.transport {
         Transport::Responses => {
-            let credential: Arc<dyn crate::credentials::CredentialProvider> =
-                match config.grok_auth_mode {
-                    AuthMode::ApiKey => Arc::new(StaticApiKeyCredential::new(
-                        config
-                            .grok_api_key
-                            .clone()
-                            .ok_or(NovaVeilSearchError::MissingConfig("GROK_SEARCH_API_KEY"))?,
-                    )),
-                    AuthMode::OAuth => {
-                        let auth_path = config
-                            .grok_auth_file
-                            .clone()
-                            .or_else(crate::config::auth_path)
-                            .ok_or_else(|| {
-                                NovaVeilSearchError::OAuth(
-                                    "oauth_auth_path_unavailable: set GROK_SEARCH_AUTH_FILE"
-                                        .to_string(),
-                                )
-                            })?;
-                        Arc::new(OAuthCredential::new(clients.grok.clone(), auth_path))
-                    }
-                };
-            Arc::new(GrokResponsesProvider::with_credential_client(
-                clients.grok.clone(),
-                config.grok_api_url.clone(),
-                credential,
-                config.web_search_enabled,
-                config.x_search_enabled,
-            ))
+            let provider = match config.grok_auth_mode {
+                AuthMode::ApiKey => GrokResponsesProvider::with_client(
+                    clients.grok.clone(),
+                    config.grok_api_url.clone(),
+                    config
+                        .grok_api_key
+                        .clone()
+                        .ok_or(NovaVeilSearchError::MissingConfig("GROK_SEARCH_API_KEY"))?,
+                    config.web_search_enabled,
+                    config.x_search_enabled,
+                )
+                .with_key_clients(clients.keyed_provider_clients("grok")),
+                AuthMode::OAuth => {
+                    let auth_path = config
+                        .grok_auth_file
+                        .clone()
+                        .or_else(crate::config::auth_path)
+                        .ok_or_else(|| {
+                            NovaVeilSearchError::OAuth(
+                                "oauth_auth_path_unavailable: set GROK_SEARCH_AUTH_FILE".to_string(),
+                            )
+                        })?;
+                    GrokResponsesProvider::with_credential_client(
+                        clients.grok.clone(),
+                        config.grok_api_url.clone(),
+                        Arc::new(OAuthCredential::new(clients.grok.clone(), auth_path)),
+                        config.web_search_enabled,
+                        config.x_search_enabled,
+                    )
+                }
+            };
+            Arc::new(provider)
         }
         Transport::ChatCompletions => {
             let url = config.openai_compatible_api_url.clone().ok_or(

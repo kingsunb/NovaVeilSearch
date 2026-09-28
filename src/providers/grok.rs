@@ -3,8 +3,10 @@ use crate::adapters::grok_responses_response::parse_grok_responses;
 use crate::credentials::{CredentialProvider, StaticApiKeyCredential};
 use crate::error::Result;
 use crate::model::search::{SearchRequest, SearchResponse};
-use crate::providers::http::{build_client, post_json};
+use crate::providers::http::{build_client, post_json, post_json_with_status, rotate_keys};
+use crate::providers::keyring::KeyRing;
 use reqwest::Client;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +15,8 @@ pub struct GrokResponsesProvider {
     client: Client,
     api_url: String,
     credential: Arc<dyn CredentialProvider>,
+    keys: Option<Arc<KeyRing>>,
+    per_key_clients: Arc<HashMap<String, Client>>,
     require_web_search: bool,
     include_x_search: bool,
 }
@@ -45,13 +49,22 @@ impl GrokResponsesProvider {
         require_web_search: bool,
         include_x_search: bool,
     ) -> Self {
-        Self::with_credential_client(
+        let api_key = api_key.into();
+        let keys = Arc::new(KeyRing::parse(&api_key));
+        let mut provider = Self::with_credential_client(
             client,
             api_url,
-            Arc::new(StaticApiKeyCredential::new(api_key.into())),
+            Arc::new(StaticApiKeyCredential::new(api_key)),
             require_web_search,
             include_x_search,
-        )
+        );
+        provider.keys = Some(keys);
+        provider
+    }
+
+    pub fn with_key_clients(mut self, clients: HashMap<String, Client>) -> Self {
+        self.per_key_clients = Arc::new(clients);
+        self
     }
 
     pub fn with_credential_client(
@@ -65,6 +78,8 @@ impl GrokResponsesProvider {
             client,
             api_url: api_url.into().trim_end_matches('/').to_string(),
             credential,
+            keys: None,
+            per_key_clients: Arc::new(HashMap::new()),
             require_web_search,
             include_x_search,
         }
@@ -77,15 +92,22 @@ impl GrokResponsesProvider {
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResponse> {
         let payload =
             to_grok_responses_payload(request, self.require_web_search, self.include_x_search)?;
-        let token = self.credential.bearer_token().await?;
-        let raw = post_json(
-            &self.client,
-            &self.endpoint(),
-            &token,
-            &payload,
-            "Grok Responses",
-        )
-        .await?;
+        let endpoint = self.endpoint();
+        let raw = if let Some(keys) = &self.keys {
+            rotate_keys(keys, "Grok Responses", |key| {
+                let client = self.per_key_clients.get(&key).unwrap_or(&self.client);
+                let endpoint = &endpoint;
+                let payload = &payload;
+                async move {
+                    post_json_with_status(client, endpoint, &key, payload, "Grok Responses").await
+                }
+            })
+            .await
+            .map_err(|failure| failure.error)?
+        } else {
+            let token = self.credential.bearer_token().await?;
+            post_json(&self.client, &endpoint, &token, &payload, "Grok Responses").await?
+        };
         parse_grok_responses(&raw)
     }
 }

@@ -6,7 +6,8 @@
 //!
 //! - Provider keys always come from the server's own environment or its
 //!   `config.toml` (`GROK_*`, `TAVILY_API_KEY`, `EXA_API_KEY`,
-//!   `TINYFISH_API_KEY`, `FIRECRAWL_API_KEY`, …; environment wins). Callers can
+//!   `TINYFISH_API_KEY`, `FIRECRAWL_API_KEY`, …). With the settings UI enabled,
+//!   saved source settings take precedence over environment defaults. Callers can
 //!   no longer supply their own keys via `X-*-Api-Key` request headers; those
 //!   headers are ignored.
 //! - Every request must authenticate with `Authorization: Bearer <token>` —
@@ -363,10 +364,14 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     // The settings/config frontend is opt-in (`NOVA_CONFIG_UI`): off by default
     // it registers no frontend routes and triggers no config.toml checks.
     if config_ui_enabled {
-        app = app.route("/", get(crate::web::serve_index)).route(
-            "/api/config",
-            get(crate::web::get_config).put(crate::web::put_config),
-        );
+        app = app
+            .route("/", get(crate::web::serve_index))
+            .route(
+                "/api/config",
+                get(crate::web::get_config).put(crate::web::put_config),
+            )
+            .route("/api/config/keys/{source}/{key_id}", get(crate::web::get_key))
+            .route("/api/config/export", get(crate::web::export_config));
     }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -1287,12 +1292,12 @@ fn cap_u64(args: &mut serde_json::Map<String, Value>, key: &str, max: u64) {
 
 /// Build a service [`Config`] from the server's own environment; keys never
 /// come from request headers. With `read_file` (settings frontend enabled via
-/// `NOVA_CONFIG_UI`) the full precedence chain (env > config.toml > defaults)
-/// applies. The service cache controls the reload interval and forces a check
+/// `NOVA_CONFIG_UI`), editable source fields prefer config.toml over env;
+/// other fields retain env precedence. The service cache forces a check
 /// after API writes. Otherwise configuration is env-only.
 fn request_config(base_env: &HashMap<String, String>, read_file: bool) -> Config {
     if read_file {
-        Config::load_from(base_env.clone())
+        Config::load_for_ui(base_env)
     } else {
         Config::from_env_map(base_env.clone())
     }

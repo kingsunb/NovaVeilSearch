@@ -440,6 +440,12 @@ impl Config {
         Self::from_env_map(std::env::vars())
     }
 
+    /// Web-managed source fields prefer the file; environment variables seed
+    /// fields that have not been saved yet. Other settings keep env precedence.
+    pub fn load_for_ui(env: &HashMap<String, String>) -> Self {
+        source_config_snapshot(env).0
+    }
+
     pub fn from_env_map<I, K, V>(vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -647,9 +653,228 @@ const KNOWN_SOURCE_NAMES: [&str; 7] = [
     "firecrawl",
 ];
 
-/// Maximum accepted length for a submitted API-key value. Generous enough for
-/// any real key, small enough that a spam body can't blow up the file.
+/// Maximum UTF-8 byte length for a submitted API-key value.
 const MAX_API_KEY_CHARS: usize = 4096;
+const MAX_SOURCE_KEYS: usize = 32;
+
+const SOURCE_FIELDS: &[(&str, &str)] = &[
+    ("grok_api_key", "GROK_SEARCH_API_KEY"),
+    ("grok_api_url", "GROK_SEARCH_URL"),
+    ("grok_model", "GROK_SEARCH_MODEL"),
+    ("web_search_enabled", "GROK_SEARCH_WEB_SEARCH"),
+    ("x_search_enabled", "GROK_SEARCH_X_SEARCH"),
+    ("tavily_api_url", "TAVILY_API_URL"),
+    ("exa_api_url", "EXA_API_URL"),
+    ("tinyfish_search_api_url", "TINYFISH_SEARCH_API_URL"),
+    ("tinyfish_fetch_api_url", "TINYFISH_FETCH_API_URL"),
+    ("serper_api_url", "SERPER_API_URL"),
+    ("firecrawl_api_url", "FIRECRAWL_API_URL"),
+    ("tavily_keyless", "TAVILY_KEYLESS"),
+    ("exa_keyless", "EXA_KEYLESS"),
+    ("firecrawl_keyless", "FIRECRAWL_KEYLESS"),
+    ("parallel_sources", "GROK_SEARCH_PARALLEL_SOURCES"),
+    ("tavily_enabled", "TAVILY_ENABLED"),
+    ("tavily_api_key", "TAVILY_API_KEY"),
+    ("firecrawl_enabled", "FIRECRAWL_ENABLED"),
+    ("firecrawl_api_key", "FIRECRAWL_API_KEY"),
+    ("tinyfish_enabled", "TINYFISH_ENABLED"),
+    ("tinyfish_api_key", "TINYFISH_API_KEY"),
+    ("exa_enabled", "EXA_ENABLED"),
+    ("exa_api_key", "EXA_API_KEY"),
+    ("serper_enabled", "SERPER_ENABLED"),
+    ("serper_api_key", "SERPER_API_KEY"),
+    ("duckduckgo_enabled", "DUCKDUCKGO_ENABLED"),
+    ("bing_enabled", "BING_ENABLED"),
+    ("source_providers", "GROK_SEARCH_SOURCE_PROVIDERS"),
+];
+
+fn source_config_snapshot(
+    env: &HashMap<String, String>,
+) -> (Config, std::collections::BTreeMap<String, bool>) {
+    let path = resolve_config_path(env);
+    let (file, state) = match path.as_deref() {
+        Some(path) => read_config_file(path),
+        None => (HashMap::new(), ConfigFileState::Absent),
+    };
+    let mut defaults = env.clone();
+    let mut env_defaults = std::collections::BTreeMap::new();
+    for &(field, variable) in SOURCE_FIELDS {
+        env_defaults.insert(
+            field.to_string(),
+            !file.contains_key(variable) && env.contains_key(variable),
+        );
+        if file.contains_key(variable) {
+            defaults.remove(variable);
+        }
+    }
+    let mut config = Config::from_env_map(merge_env_over_file(file, defaults));
+    config.config_file_path = path;
+    config.config_file_state = state;
+    (config, env_defaults)
+}
+
+fn source_keys(config: &Config, source: &str) -> Option<Vec<String>> {
+    let raw = match source {
+        "grok" => &config.grok_api_key,
+        "tavily" => &config.tavily_api_key,
+        "exa" => &config.exa_api_key,
+        "tinyfish" => &config.tinyfish_api_key,
+        "serper" => &config.serper_api_key,
+        "firecrawl" => &config.firecrawl_api_key,
+        _ => return None,
+    };
+    let mut keys = Vec::new();
+    for key in raw
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        if !keys.iter().any(|existing| existing == key) {
+            keys.push(key.to_string());
+        }
+    }
+    Some(keys)
+}
+
+fn fingerprint(value: &[u8]) -> String {
+    use base64::Engine;
+    let digest = ring::digest::digest(&ring::digest::SHA256, value);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn key_id(source: &str, value: &str) -> String {
+    fingerprint(format!("{source}:{value}").as_bytes())
+}
+
+fn masked_key(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 12 {
+        return "••••••••".to_string();
+    }
+    format!(
+        "{}••••{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
+}
+
+/// Lookup for the authenticated, explicitly requested reveal endpoint only.
+pub fn reveal_source_key(env: &HashMap<String, String>, source: &str, id: &str) -> Option<String> {
+    source_keys(&Config::load_for_ui(env), source)?
+        .into_iter()
+        .find(|value| key_id(source, value) == id)
+}
+
+const SOURCE_URL_FIELDS: &[&str] = &[
+    "grok_api_url",
+    "tavily_api_url",
+    "exa_api_url",
+    "tinyfish_search_api_url",
+    "tinyfish_fetch_api_url",
+    "serper_api_url",
+    "firecrawl_api_url",
+];
+
+fn source_urls(cfg: &Config, source: &str) -> std::collections::BTreeMap<String, String> {
+    let urls = match source {
+        "grok" => vec![("grok_api_url", cfg.grok_api_url.as_str())],
+        "tavily" => vec![("tavily_api_url", cfg.tavily_api_url.as_str())],
+        "exa" => vec![
+            ("exa_api_url", cfg.exa_api_url.as_str()),
+            ("mcp_endpoint", "https://mcp.exa.ai/mcp"),
+        ],
+        "tinyfish" => vec![
+            ("tinyfish_search_api_url", cfg.tinyfish_search_api_url.as_str()),
+            ("tinyfish_fetch_api_url", cfg.tinyfish_fetch_api_url.as_str()),
+        ],
+        "serper" => vec![("serper_api_url", cfg.serper_api_url.as_str())],
+        "firecrawl" => vec![("firecrawl_api_url", cfg.firecrawl_api_url.as_str())],
+        "duckduckgo" => vec![
+            ("html_endpoint", "https://html.duckduckgo.com/html/"),
+            ("lite_endpoint", "https://lite.duckduckgo.com/lite/"),
+        ],
+        "bing" => vec![("search_endpoint", "https://www.bing.com/search")],
+        _ => vec![],
+    };
+    urls.into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Only returned by the explicit authenticated export action. Contains secrets.
+#[derive(Serialize)]
+pub struct SourceExportFile {
+    pub format: &'static str,
+    pub version: u8,
+    pub source_providers: Vec<String>,
+    pub parallel_sources: bool,
+    pub grok_model: String,
+    pub web_search_enabled: bool,
+    pub x_search_enabled: bool,
+    pub sources: std::collections::BTreeMap<String, SourceExport>,
+}
+
+#[derive(Serialize)]
+pub struct SourceExport {
+    pub enabled: bool,
+    pub keyless: bool,
+    pub api_urls: std::collections::BTreeMap<String, String>,
+    pub api_keys: Vec<String>,
+}
+
+pub fn export_source_config(env: &HashMap<String, String>) -> SourceExportFile {
+    let (cfg, env_defaults) = source_config_snapshot(env);
+    let view = source_config_view(&cfg, env_defaults);
+    SourceExportFile {
+        format: "nova-veil-search/sources",
+        version: 1,
+        source_providers: view.source_providers,
+        parallel_sources: view.parallel_sources,
+        grok_model: view.grok_model,
+        web_search_enabled: view.web_search_enabled,
+        x_search_enabled: view.x_search_enabled,
+        sources: view
+            .sources
+            .into_iter()
+            .map(|(name, source)| {
+                let keys = source_keys(&cfg, &name).unwrap_or_default();
+                (
+                    name,
+                    SourceExport {
+                        enabled: source.enabled,
+                        keyless: source.keyless,
+                        api_urls: source.api_urls,
+                        api_keys: keys,
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceKeyView {
+    pub id: String,
+    pub masked: String,
+}
+
+/// Retain an existing key without sending its secret back, or add a new value.
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceKeyEdit {
+    pub id: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("configuration changed; refresh before saving")]
+pub struct ConfigConflict;
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid source configuration")]
+pub struct InvalidSourceEdits(pub Vec<FieldError>);
 
 /// Two-state presence marker for a secret. Serialized as `"set"` / `"unset"` —
 /// the value itself is never emitted, not even a fragment.
@@ -660,11 +885,13 @@ pub enum KeyStatus {
     Unset,
 }
 
-/// Effective, masked view of one search source (`enabled` + `api_key` presence).
+/// Effective source configuration with masked key entries and endpoint URLs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceView {
     pub enabled: bool,
     pub api_key: KeyStatus,
+    pub api_keys: Vec<SourceKeyView>,
+    pub api_urls: std::collections::BTreeMap<String, String>,
     /// Whether this provider can run without a key in the current configuration.
     pub keyless: bool,
 }
@@ -675,11 +902,16 @@ pub struct SourceView {
 /// `"rejected"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourcesView {
+    pub revision: String,
     pub source_providers: Vec<String>,
     pub default_source_providers: Vec<String>,
     pub parallel_sources: bool,
+    pub grok_model: String,
+    pub web_search_enabled: bool,
+    pub x_search_enabled: bool,
     pub sources: std::collections::BTreeMap<String, SourceView>,
     pub env_overrides: std::collections::BTreeMap<String, bool>,
+    pub env_defaults: std::collections::BTreeMap<String, bool>,
     pub config_file: Option<String>,
     pub config_file_state: String,
 }
@@ -687,9 +919,19 @@ pub struct SourcesView {
 /// Editable subset accepted by `PUT /api/config`. `None` = "unchanged";
 /// `Some("")` on an `*_api_key` = "clear the key". Unknown top-level keys are
 /// rejected by serde's `deny_unknown_fields`.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct SourceEdits {
+    pub revision: Option<String>,
+    pub api_keys: Option<std::collections::BTreeMap<String, Vec<SourceKeyEdit>>>,
+    pub api_urls: Option<std::collections::BTreeMap<String, String>>,
+    pub grok_model: Option<String>,
+    pub web_search_enabled: Option<bool>,
+    pub x_search_enabled: Option<bool>,
+    pub tavily_keyless: Option<bool>,
+    pub exa_keyless: Option<bool>,
+    pub firecrawl_keyless: Option<bool>,
+    pub parallel_sources: Option<bool>,
     pub tavily_enabled: Option<bool>,
     pub tavily_api_key: Option<String>,
     pub firecrawl_enabled: Option<bool>,
@@ -712,58 +954,80 @@ pub struct FieldError {
     pub message: String,
 }
 
-/// Effective, masked view of what the server currently uses (env > file > defaults).
+/// Effective, masked view using the same precedence as HTTP search requests.
 pub fn load_source_config(env: &HashMap<String, String>) -> SourcesView {
-    let cfg = Config::load_from(env.clone());
+    let (cfg, env_defaults) = source_config_snapshot(env);
+    source_config_view(&cfg, env_defaults)
+}
+
+fn source_config_view(
+    cfg: &Config,
+    env_defaults: std::collections::BTreeMap<String, bool>,
+) -> SourcesView {
     let mut sources = std::collections::BTreeMap::new();
-    for name in KNOWN_SOURCE_NAMES {
-        let (enabled, has_key, keyless) = match name {
-            "tavily" => (
-                cfg.tavily_enabled,
-                cfg.tavily_api_key.is_some(),
-                cfg.tavily_keyless,
-            ),
-            "firecrawl" => (
-                cfg.firecrawl_enabled,
-                cfg.firecrawl_api_key.is_some(),
-                cfg.firecrawl_keyless,
-            ),
-            "tinyfish" => (cfg.tinyfish_enabled, cfg.tinyfish_api_key.is_some(), false),
-            "exa" => (cfg.exa_enabled, cfg.exa_api_key.is_some(), cfg.exa_keyless),
-            "serper" => (cfg.serper_enabled, cfg.serper_api_key.is_some(), false),
-            "duckduckgo" => (cfg.duckduckgo_enabled, false, true),
-            "bing" => (cfg.bing_enabled, false, true),
+    for name in std::iter::once("grok").chain(KNOWN_SOURCE_NAMES) {
+        let (enabled, keyless) = match name {
+            "grok" => (true, false),
+            "tavily" => (cfg.tavily_enabled, cfg.tavily_keyless),
+            "firecrawl" => (cfg.firecrawl_enabled, cfg.firecrawl_keyless),
+            "tinyfish" => (cfg.tinyfish_enabled, false),
+            "exa" => (cfg.exa_enabled, cfg.exa_keyless),
+            "serper" => (cfg.serper_enabled, false),
+            "duckduckgo" => (cfg.duckduckgo_enabled, true),
+            "bing" => (cfg.bing_enabled, true),
             _ => unreachable!("KNOWN_SOURCE_NAMES is exhaustive"),
+        };
+        let api_keys: Vec<_> = source_keys(cfg, name)
+            .unwrap_or_default()
+            .iter()
+            .map(|value| SourceKeyView {
+                id: key_id(name, value),
+                masked: masked_key(value),
+            })
+            .collect();
+        let api_key = if api_keys.is_empty() {
+            KeyStatus::Unset
+        } else {
+            KeyStatus::Set
         };
         sources.insert(
             name.to_string(),
             SourceView {
                 enabled,
-                api_key: if has_key {
-                    KeyStatus::Set
-                } else {
-                    KeyStatus::Unset
-                },
+                api_keys,
+                api_urls: source_urls(cfg, name),
+                api_key,
                 keyless,
             },
         );
     }
 
-    SourcesView {
+    let mut view = SourcesView {
+        revision: String::new(),
         source_providers: cfg.source_providers.clone(),
         default_source_providers: KNOWN_SOURCE_NAMES
             .iter()
             .map(|name| name.to_string())
             .collect(),
         parallel_sources: cfg.parallel_sources,
+        grok_model: cfg.grok_model.clone(),
+        web_search_enabled: cfg.web_search_enabled,
+        x_search_enabled: cfg.x_search_enabled,
         sources,
-        env_overrides: env_override_map(env),
+        // Retained for older clients; editable source fields are no longer locked.
+        env_overrides: SOURCE_FIELDS
+            .iter()
+            .map(|(field, _)| (field.to_string(), false))
+            .collect(),
+        env_defaults,
         config_file: cfg
             .config_file_path
             .as_ref()
             .map(|p| redact_path(&p.display().to_string())),
         config_file_state: cfg.config_file_state.as_str().to_string(),
-    }
+    };
+    view.revision = fingerprint(&serde_json::to_vec(&view).expect("source view serializes"));
+    view
 }
 
 /// Returns a (possibly empty) list of structural/semantic errors for `edits`.
@@ -793,6 +1057,94 @@ pub fn validate_edits(edits: &SourceEdits) -> Vec<FieldError> {
         }
     }
 
+    if let Some(sources) = &edits.api_keys {
+        for (source, keys) in sources {
+            let field = format!("api_keys.{source}");
+            let legacy = match source.as_str() {
+                "grok" => false,
+                "tavily" => edits.tavily_api_key.is_some(),
+                "exa" => edits.exa_api_key.is_some(),
+                "tinyfish" => edits.tinyfish_api_key.is_some(),
+                "serper" => edits.serper_api_key.is_some(),
+                "firecrawl" => edits.firecrawl_api_key.is_some(),
+                _ => {
+                    errors.push(FieldError {
+                        field,
+                        message: "unknown keyed source provider".into(),
+                    });
+                    continue;
+                }
+            };
+            if legacy {
+                errors.push(FieldError {
+                    field: field.clone(),
+                    message: "cannot combine api_keys with the legacy api_key field".into(),
+                });
+            }
+            if keys.len() > MAX_SOURCE_KEYS {
+                errors.push(FieldError {
+                    field: field.clone(),
+                    message: format!("at most {MAX_SOURCE_KEYS} keys per source"),
+                });
+            }
+            for key in keys {
+                let valid = match (&key.id, &key.value) {
+                    (Some(id), None) => {
+                        !id.is_empty()
+                            && id.len() <= 64
+                            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    }
+                    (None, Some(value)) => {
+                        !value.trim().is_empty()
+                            && value.len() <= MAX_API_KEY_CHARS
+                            && !value.contains(',')
+                            && !value.chars().any(char::is_control)
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    errors.push(FieldError {
+                        field: field.clone(),
+                        message: format!(
+                            "each key needs either an existing id or a nonempty value (max {MAX_API_KEY_CHARS} bytes, no commas or control characters)"
+                        ),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(urls) = &edits.api_urls {
+        for (field, value) in urls {
+            let valid = SOURCE_URL_FIELDS.contains(&field.as_str())
+                && value.len() <= 2048
+                && !value.chars().any(char::is_control)
+                && url::Url::parse(value.trim()).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none()
+                });
+            if !valid {
+                errors.push(FieldError {
+                    field: format!("api_urls.{field}"),
+                    message: "use a supported source URL field and an http(s) URL without credentials, query or fragment".into(),
+                });
+            }
+        }
+    }
+    if let Some(model) = &edits.grok_model {
+        if model.trim().is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            errors.push(FieldError {
+                field: "grok_model".into(),
+                message: "model must be nonempty and at most 256 bytes, without control characters".into(),
+            });
+        }
+    }
+
     if let Some(list) = &edits.source_providers {
         for name in list {
             let normalized = normalize_source_provider(name);
@@ -817,6 +1169,22 @@ pub fn write_source_config(
     env: &HashMap<String, String>,
     edits: &SourceEdits,
 ) -> anyhow::Result<SourcesView> {
+    let errors = validate_edits(edits);
+    if !errors.is_empty() {
+        return Err(InvalidSourceEdits(errors).into());
+    }
+    let (cfg, env_defaults) = source_config_snapshot(env);
+    let current = source_config_view(&cfg, env_defaults);
+    if edits
+        .revision
+        .as_ref()
+        .is_some_and(|revision| *revision != current.revision)
+    {
+        return Err(ConfigConflict.into());
+    }
+    if current.config_file_state == "rejected" {
+        anyhow::bail!("refusing to overwrite invalid config file");
+    }
     let path = resolve_config_path(env).ok_or_else(|| {
         anyhow::anyhow!("cannot resolve config path (set GROK_SEARCH_CONFIG or HOME)")
     })?;
@@ -834,39 +1202,52 @@ pub fn write_source_config(
     };
 
     apply_edits(&mut doc, edits);
+    if let Some(sources) = &edits.api_keys {
+        for (source, edits) in sources {
+            let existing = source_keys(&cfg, source).unwrap_or_default();
+            let mut values = Vec::new();
+            for edit in edits {
+                let value = if let Some(id) = &edit.id {
+                    existing
+                        .iter()
+                        .find(|value| key_id(source, value) == *id)
+                        .cloned()
+                        .ok_or(ConfigConflict)?
+                } else {
+                    edit.value.as_deref().unwrap_or_default().trim().to_string()
+                };
+                if !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+            // An explicit empty value overrides an environment default too.
+            let field = format!("{source}_api_key");
+            doc[field.as_str()] = toml_edit::value(values.join(","));
+        }
+    }
     atomic_write(&path, &doc.to_string())?;
 
     Ok(load_source_config(env))
 }
 
-/// TOML field -> whether its env var is present in the operator environment.
-/// Presence (not value) is what decides precedence: once the env var exists the
-/// file value cannot win, so the UI must mark that field read-only.
-fn env_override_map(env: &HashMap<String, String>) -> std::collections::BTreeMap<String, bool> {
-    [
-        ("tavily_enabled", "TAVILY_ENABLED"),
-        ("tavily_api_key", "TAVILY_API_KEY"),
-        ("firecrawl_enabled", "FIRECRAWL_ENABLED"),
-        ("firecrawl_api_key", "FIRECRAWL_API_KEY"),
-        ("tinyfish_enabled", "TINYFISH_ENABLED"),
-        ("tinyfish_api_key", "TINYFISH_API_KEY"),
-        ("exa_enabled", "EXA_ENABLED"),
-        ("exa_api_key", "EXA_API_KEY"),
-        ("serper_enabled", "SERPER_ENABLED"),
-        ("serper_api_key", "SERPER_API_KEY"),
-        ("duckduckgo_enabled", "DUCKDUCKGO_ENABLED"),
-        ("bing_enabled", "BING_ENABLED"),
-        ("source_providers", "GROK_SEARCH_SOURCE_PROVIDERS"),
-    ]
-    .into_iter()
-    .map(|(field, env_var)| (field.to_string(), env.contains_key(env_var)))
-    .collect()
-}
-
 /// Apply only the present (`Some`) edit fields onto a `DocumentMut`. Comments,
 /// key order, and every unmanaged key are preserved verbatim.
 fn apply_edits(doc: &mut toml_edit::DocumentMut, edits: &SourceEdits) {
+    if let Some(urls) = &edits.api_urls {
+        for (field, value) in urls {
+            doc[field.as_str()] = toml_edit::value(value.trim());
+        }
+    }
+    if let Some(model) = &edits.grok_model {
+        doc["grok_model"] = toml_edit::value(model.trim());
+    }
     for (key, enabled) in [
+        ("web_search_enabled", edits.web_search_enabled),
+        ("x_search_enabled", edits.x_search_enabled),
+        ("tavily_keyless", edits.tavily_keyless),
+        ("exa_keyless", edits.exa_keyless),
+        ("firecrawl_keyless", edits.firecrawl_keyless),
+        ("parallel_sources", edits.parallel_sources),
         ("duckduckgo_enabled", edits.duckduckgo_enabled),
         ("bing_enabled", edits.bing_enabled),
     ] {
@@ -904,11 +1285,7 @@ fn apply_edits(doc: &mut toml_edit::DocumentMut, edits: &SourceEdits) {
         if let Some(value) = api_key {
             let key = format!("{base}_api_key");
             let trimmed = value.trim();
-            if trimmed.is_empty() {
-                doc.remove(key.as_str());
-            } else {
-                doc[key.as_str()] = toml_edit::value(trimmed);
-            }
+            doc[key.as_str()] = toml_edit::value(trimmed);
         }
     }
 
@@ -945,9 +1322,23 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or("config.toml");
     let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, contents)?;
-    let file = std::fs::File::open(&tmp)?;
-    let _ = file.sync_all(); // best-effort fsync before rename
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        use std::io::Write;
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -1631,7 +2022,7 @@ mod source_config_api_tests {
     }
 
     #[test]
-    fn env_override_detection_is_presence_based() {
+    fn environment_defaults_are_visible_and_editable() {
         let mut env = HashMap::new();
         env.insert("TAVILY_API_KEY".to_string(), "tvly-secret".to_string());
         env.insert("TAVILY_ENABLED".to_string(), "false".to_string());
@@ -1640,9 +2031,10 @@ mod source_config_api_tests {
             "tavily,exa".to_string(),
         );
         let view = load_source_config(&env);
-        assert!(view.env_overrides["tavily_api_key"]);
-        assert!(view.env_overrides["tavily_enabled"]);
-        assert!(view.env_overrides["source_providers"]);
+        assert!(view.env_defaults["tavily_api_key"]);
+        assert!(view.env_defaults["tavily_enabled"]);
+        assert!(view.env_defaults["source_providers"]);
+        assert!(view.env_overrides.values().all(|locked| !locked));
         assert!(!view.env_overrides["exa_api_key"]);
         assert!(!view.env_overrides["exa_enabled"]);
         assert_eq!(view.sources["tavily"].api_key, KeyStatus::Set);
@@ -1703,7 +2095,7 @@ mod source_config_api_tests {
     }
 
     #[test]
-    fn clear_key_removes_it_from_the_file() {
+    fn clear_key_persists_an_explicit_empty_value() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "exa_api_key = \"exa-k\"\nexa_enabled = true\n").unwrap();
@@ -1720,7 +2112,7 @@ mod source_config_api_tests {
 
         assert_eq!(view.sources["exa"].api_key, KeyStatus::Unset);
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(!body.contains("exa_api_key"), "{body}");
+        assert!(body.contains("exa_api_key = \"\""), "{body}");
     }
 
     #[test]

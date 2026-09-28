@@ -28,11 +28,10 @@ services:
       NOVA_SESSION_TTL_SECONDS: "${NOVA_SESSION_TTL_SECONDS:-43200}"
       # Settings/config frontend (GET / + /api/config) — opt-in, OFF by default.
       # Set NOVA_CONFIG_UI=true in .env to serve the embedded settings page.
-      # Config is persisted in nova_config; env values still take precedence.
+      # Config is persisted in nova_config; saved source fields override env defaults.
       NOVA_CONFIG_UI: "${NOVA_CONFIG_UI:-false}"
       GROK_SEARCH_API_KEY: "${GROK_SEARCH_API_KEY:-}"
-      # Leave absent when managing this key through the settings page. A bare
-      # entry passes through a configured value and omits an unresolved one.
+      # Optional initial keys; the settings page can replace or delete them.
       TAVILY_API_KEY:
       # Optional extra source providers: uncomment and fill as needed.
       # EXA_API_KEY:
