@@ -83,8 +83,8 @@ file edits are checked at most once a second. OFF returns `404` on all frontend
 routes and keeps request config env-only. Local stdio precedence is unchanged.
 
 The page manages Grok, Tavily, Exa, TinyFish, Serper and Firecrawl key lists
-(up to 32 keys per channel). Keys rotate between requests and fail over on
-key-scoped HTTP errors. Existing environment keys appear as editable defaults;
+(up to 1000 keys per channel, displayed 50 per page). Keys rotate between requests
+and fail over on key-scoped HTTP errors. Existing environment keys appear as editable defaults;
 deleting the last key writes an explicit empty string, preventing an old env
 value from becoming active again. DuckDuckGo and Bing use fixed scraping
 endpoints and do not accept keys.
@@ -130,7 +130,8 @@ through `GET /api/config/export`. These responses use `Cache-Control: no-store`.
 settings. An empty key array deletes all keys for that channel. Include the
 `revision` returned by GET to detect stale edits (HTTP 409); the page does this
 automatically. Imports go through the same validated PUT when saved. Request
-bodies and import files are limited to 2 MiB. Keys must be nonempty, at most
+bodies and import files are limited to 64 MiB, allowing all six keyed channels
+to be transferred together. Keys must be nonempty, at most
 4096 UTF-8 bytes, and contain no commas or control characters.
 
 ## Grok Responses

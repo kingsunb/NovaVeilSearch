@@ -22,7 +22,8 @@ use crate::config::{
 use crate::http::{authorize, origin_allowed, unauthorized_response, AppState};
 
 /// Bound the JSON body for a partial source-config write.
-const MAX_CONFIG_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Fits six channels of 1000 keys at 4096 bytes each, plus JSON escaping.
+const MAX_CONFIG_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// `GET /` — the SPA shell. Unauthenticated by design: the page contains no
 /// secrets; it only fetches config behind an authenticated API.

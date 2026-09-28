@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -655,7 +655,7 @@ const KNOWN_SOURCE_NAMES: [&str; 7] = [
 
 /// Maximum UTF-8 byte length for a submitted API-key value.
 const MAX_API_KEY_CHARS: usize = 4096;
-const MAX_SOURCE_KEYS: usize = 32;
+const MAX_SOURCE_KEYS: usize = 1000;
 
 const SOURCE_FIELDS: &[(&str, &str)] = &[
     ("grok_api_key", "GROK_SEARCH_API_KEY"),
@@ -724,6 +724,7 @@ fn source_keys(config: &Config, source: &str) -> Option<Vec<String>> {
         _ => return None,
     };
     let mut keys = Vec::new();
+    let mut seen = HashSet::new();
     for key in raw
         .as_deref()
         .unwrap_or_default()
@@ -731,7 +732,7 @@ fn source_keys(config: &Config, source: &str) -> Option<Vec<String>> {
         .map(str::trim)
         .filter(|key| !key.is_empty())
     {
-        if !keys.iter().any(|existing| existing == key) {
+        if seen.insert(key) {
             keys.push(key.to_string());
         }
     }
@@ -1213,19 +1214,20 @@ pub fn write_source_config(
     apply_edits(&mut doc, edits);
     if let Some(sources) = &edits.api_keys {
         for (source, edits) in sources {
-            let existing = source_keys(&cfg, source).unwrap_or_default();
+            let existing: HashMap<_, _> = source_keys(&cfg, source)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| (key_id(source, &value), value))
+                .collect();
             let mut values = Vec::new();
+            let mut seen = HashSet::new();
             for edit in edits {
                 let value = if let Some(id) = &edit.id {
-                    existing
-                        .iter()
-                        .find(|value| key_id(source, value) == *id)
-                        .cloned()
-                        .ok_or(ConfigConflict)?
+                    existing.get(id).cloned().ok_or(ConfigConflict)?
                 } else {
                     edit.value.as_deref().unwrap_or_default().trim().to_string()
                 };
-                if !values.contains(&value) {
+                if seen.insert(value.clone()) {
                     values.push(value);
                 }
             }

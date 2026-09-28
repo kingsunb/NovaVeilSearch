@@ -125,7 +125,8 @@
   .key-label { display: flex; align-items: center; justify-content: space-between; gap: 5px; font-size: 10px; color: var(--muted); margin-bottom: 7px; }
   .key-row { display: flex; align-items: center; gap: 5px; }
   .key-list { display: grid; gap: 8px; margin-bottom: 10px; max-height: 264px; overflow-y: auto; }
-  .key-number { font-size: 10px; color: var(--muted); width: 16px; flex: 0 0 auto; }
+  .key-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 11px; color: var(--muted); }
+  .key-number { font-size: 10px; color: var(--muted); width: 28px; flex: 0 0 auto; }
   .key-row .key-value { font-family: ui-monospace, Consolas, monospace; }
   .key-row .key-delete:hover { color: var(--red); background: #faeded; }
   .key-empty { color: var(--muted); font-size: 11px; padding: 12px 0; }
@@ -341,10 +342,11 @@
   const OPTION_FIELDS = ['grok_model', 'web_search_enabled', 'x_search_enabled', 'parallel_sources'];
   const KEYLESS_MODES = ['tavily', 'exa', 'firecrawl'];
   const URL_LABELS = { grok_api_url: 'API 地址', tavily_api_url: 'API 地址', exa_api_url: 'API 地址', tinyfish_search_api_url: '搜索 API 地址', tinyfish_fetch_api_url: '提取 API 地址', serper_api_url: 'API 地址', firecrawl_api_url: 'API 地址', html_endpoint: 'HTML 搜索地址（固定）', lite_endpoint: 'Lite 搜索地址（固定）', search_endpoint: '搜索地址（固定）' };
-  const MAX_KEYS = 32;
+  const MAX_KEYS = 1000;
+  const KEYS_PER_PAGE = 50;
   const editableUrl = field => field.endsWith('_api_url');
   URL_LABELS.mcp_endpoint = '匿名 MCP 地址（固定）';
-  const MAX_TRANSFER_BYTES = 2 * 1024 * 1024;
+  const MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
   try { ui.token = sessionStorage.getItem(TOKEN_KEY) || ''; } catch (_) { /* Login still works without browser storage. */ }
 
   function storeToken(value) {
@@ -684,6 +686,22 @@
       refs.keyStatus = element('span');
       labelRow.append(element('span', '', 'API 密钥'), refs.keyStatus);
       refs.keyList = element('div', 'key-list');
+      refs.keyPage = 0;
+      refs.keyPagination = element('div', 'key-pagination');
+      refs.previousPage = element('button', 'btn small', '上一页');
+      refs.nextPage = element('button', 'btn small', '下一页');
+      refs.pageLabel = element('span');
+      refs.pageLabel.setAttribute('aria-live', 'polite');
+      for (const [button, delta, label] of [[refs.previousPage, -1, '上一页'], [refs.nextPage, 1, '下一页']]) {
+        button.type = 'button';
+        button.setAttribute('aria-label', meta.label + ' 密钥' + label);
+        button.addEventListener('click', () => {
+          if (ui.busy) return;
+          refs.keyPage += delta;
+          renderKeys(meta, refs);
+        });
+      }
+      refs.keyPagination.append(refs.previousPage, refs.pageLabel, refs.nextPage);
       refs.add = element('button', 'btn small', '+ 添加密钥');
       refs.add.type = 'button';
       refs.add.setAttribute('aria-label', '添加 ' + meta.label + ' 密钥');
@@ -691,11 +709,12 @@
         if (ui.busy || draft.keys.length >= MAX_KEYS) return;
         const key = { value: '', uid: ++ui.nextKey };
         draft.keys.push(key);
+        refs.keyPage = Math.floor((draft.keys.length - 1) / KEYS_PER_PAGE);
         renderKeys(meta, refs);
         updateSummary();
         $('key-' + key.uid).focus();
       });
-      keys.append(labelRow, refs.keyList, refs.add);
+      keys.append(labelRow, refs.keyList, refs.keyPagination, refs.add);
       if (KEYLESS_MODES.includes(id)) {
         const options = element('div', 'source-options');
         options.style.marginTop = '10px';
@@ -717,9 +736,17 @@
 
   function renderKeys(meta, refs) {
     const draft = ui.drafts.get(meta.id);
+    const pages = Math.max(1, Math.ceil(draft.keys.length / KEYS_PER_PAGE));
+    refs.keyPage = Math.max(0, Math.min(refs.keyPage, pages - 1));
+    const start = refs.keyPage * KEYS_PER_PAGE;
+    refs.keyPagination.hidden = pages === 1;
+    refs.previousPage.disabled = refs.keyPage === 0;
+    refs.nextPage.disabled = refs.keyPage === pages - 1;
+    refs.pageLabel.textContent = (start + 1) + '–' + Math.min(start + KEYS_PER_PAGE, draft.keys.length) + ' / ' + draft.keys.length;
     const fragment = document.createDocumentFragment();
     if (!draft.keys.length) fragment.append(element('p', 'key-empty', '暂无密钥，点击下方按钮添加。'));
-    draft.keys.forEach((key, index) => {
+    draft.keys.slice(start, start + KEYS_PER_PAGE).forEach((key, offset) => {
+      const index = start + offset;
       const row = element('div', 'key-row');
       const input = document.createElement('input');
       input.id = 'key-' + key.uid;
@@ -782,6 +809,7 @@
       fragment.append(row);
     });
     refs.keyList.replaceChildren(fragment);
+    refs.keyList.scrollTop = 0;
   }
 
   function renderOrder(focusId) {
@@ -956,9 +984,11 @@
       }
       if (!Array.isArray(source.api_keys) || source.api_keys.length > MAX_KEYS || (meta.keyless && source.api_keys.length)) throw new Error(meta.label + ' 的密钥列表无效。');
       const values = [];
+      const seen = new Set();
       for (const value of source.api_keys) {
         validateKey(value);
-        if (!values.includes(value.trim())) values.push(value.trim());
+        const trimmed = value.trim();
+        if (!seen.has(trimmed)) { seen.add(trimmed); values.push(trimmed); }
       }
       for (const field of ['enabled', 'keyless']) {
         if (field in source && typeof source[field] !== 'boolean') throw new Error(meta.label + ' 的 ' + field + ' 必须为布尔值。');
@@ -987,7 +1017,7 @@
     const file = event.target.files[0];
     event.target.value = '';
     if (!file || ui.busy || !ui.current) return;
-    if (file.size > MAX_TRANSFER_BYTES) { feedback('导入文件不能超过 2 MiB。', 'error'); return; }
+    if (file.size > MAX_TRANSFER_BYTES) { feedback('导入文件不能超过 64 MiB。', 'error'); return; }
     ui.busy = true;
     updateSummary();
     renderOrder();
