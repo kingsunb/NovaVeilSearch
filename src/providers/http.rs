@@ -206,6 +206,31 @@ pub struct HttpClients {
 }
 
 impl HttpClients {
+    /// Keep both transports on the same provider/proxy registry.
+    pub(crate) fn from_config(config: &crate::config::Config, restricted: bool) -> Self {
+        let keyed_keys = [
+            ("tavily", config.tavily_api_key.as_deref()),
+            ("exa", config.exa_api_key.as_deref()),
+            ("tinyfish", config.tinyfish_api_key.as_deref()),
+            ("firecrawl", config.firecrawl_api_key.as_deref()),
+            ("serper", config.serper_api_key.as_deref()),
+        ];
+        Self::build_inner(
+            config.timeout,
+            config.proxy_key.as_deref(),
+            config.proxy_keyless.as_deref(),
+            config.proxy_grok.as_deref(),
+            &keyed_keys,
+            match config.transport {
+                crate::config::Transport::Responses => config.grok_api_key.as_deref(),
+                crate::config::Transport::ChatCompletions => {
+                    config.openai_compatible_api_key.as_deref()
+                }
+            },
+            restricted,
+        )
+    }
+
     /// Plain (non-restricted) clients for the stdio / local path.
     pub fn build(
         timeout: Duration,
@@ -1054,11 +1079,11 @@ async fn read_sse_json(
     {
         buffer.extend_from_slice(&chunk);
 
-        while let Some((event, rest)) = split_sse_event(&buffer) {
-            let event = event.to_vec();
-            buffer = rest.to_vec();
+        let mut consumed = 0;
+        while let Some((event, rest)) = split_sse_event(&buffer[consumed..]) {
+            consumed = buffer.len() - rest.len();
             if let Some(value) = process_sse_event(
-                &event,
+                event,
                 label,
                 &mut last_json,
                 &mut chat_metadata,
@@ -1067,6 +1092,11 @@ async fn read_sse_json(
             )? {
                 return Ok(value);
             }
+        }
+        // Compact once per network chunk, rather than copying the remaining
+        // buffer after every event in a chunk containing many deltas.
+        if consumed > 0 {
+            drop(buffer.drain(..consumed));
         }
     }
 

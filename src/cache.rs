@@ -123,16 +123,10 @@ impl QueryResultCache {
 
     fn evict_expired(&mut self) {
         let ttl = self.ttl;
-        let expired: Vec<String> = self
-            .values
-            .iter()
-            .filter(|(_, entry)| entry.fetched_at.elapsed() > ttl)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in expired {
-            self.values.remove(&key);
-            self.order.retain(|existing| existing != &key);
-        }
+        self.values
+            .retain(|_, entry| entry.fetched_at.elapsed() <= ttl);
+        let values = &self.values;
+        self.order.retain(|key| values.contains_key(key));
     }
 }
 

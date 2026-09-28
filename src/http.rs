@@ -17,12 +17,17 @@
 //!   admin username/password and returns a session token with a sliding TTL
 //!   (`NOVA_SESSION_TTL_SECONDS`, default 12 h) held in an in-memory store.
 //!
-//! A fully-credentialed [`SearchService`] is built per request via
-//! [`SearchService::for_request`], reusing one shared set of HTTP clients (keyed
-//! / keyless / grok, each honoring the operator's `NOVA_PROXY_*` settings) and
-//! one process-wide source cache (so `get_sources` continuation still works
-//! across requests). The whole module is gated behind the `http` feature so the
-//! default stdio build never links axum.
+//! Requests share a fully-credentialed [`SearchService`], its provider clients,
+//! key rotation and query cache. With the settings UI enabled, config changes
+//! rebuild the service; successful API writes refresh it immediately and
+//! request-triggered file checks are throttled to once a second. A separate
+//! process-wide source cache preserves `get_sources` across service reloads.
+//! Accepted HTTP searches also retain their complete reply for polling at
+//! `GET /mcp/tasks/{task_id}`. Disconnecting a client only ends delivery;
+//! the worker keeps its concurrency permit until completion. Clients can opt
+//! into `Prefer: respond-async` and retry with an `Idempotency-Key`.
+//! The whole module is gated behind the `http` feature so the default stdio
+//! build never links axum.
 //!
 //! TLS terminates upstream (Caddy); this server binds loopback only.
 //!
@@ -38,15 +43,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, Semaphore};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 
 use crate::cache::SourceCache;
 use crate::config::Config;
@@ -54,6 +59,9 @@ use crate::error::NovaVeilSearchError;
 use crate::mcp::{error_response, handle_message};
 use crate::model::tool::{WebSearchInput, WebSearchOutput};
 use crate::service::SearchService;
+
+mod tasks;
+use tasks::{TaskHandle, TaskResult};
 
 /// Max JSON request body. MCP tool calls are tiny; anything larger is abuse.
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -90,7 +98,7 @@ const SESSION_TTL_ENV: &str = "NOVA_SESSION_TTL_SECONDS";
 const DEFAULT_SESSION_TTL_SECONDS: u64 = 12 * 60 * 60;
 
 /// Opt-in flag for the settings/config frontend (`GET /` + `/api/config`) and
-/// the per-request `config.toml` read. OFF by default: pure backend.
+/// request-triggered, throttled `config.toml` reloads. OFF by default.
 const CONFIG_UI_ENV: &str = "NOVA_CONFIG_UI";
 
 /// Max login-form body. Two short fields; anything larger is abuse.
@@ -110,13 +118,16 @@ const SSE_HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// Shared across every request: one connection pool per proxy category,
-    /// operator timeout. Keyed / keyless / grok clients are intentionally
-    /// distinct so each can route through its own proxy (or none).
-    clients: crate::providers::http::HttpClients,
+    /// Providers, key rotation and query cache survive across HTTP requests.
+    service: Arc<RwLock<Option<CachedService>>>,
+    service_reload: Arc<Mutex<()>>,
+    /// Serialize config read/merge/write operations from different browsers.
+    pub(crate) config_write_lock: Arc<Mutex<()>>,
     /// One process-wide cache so `get_sources` continuation survives requests.
     cache: Arc<Mutex<SourceCache>>,
-    /// Operator defaults that seed every request's config: the server's own
+    /// Complete HTTP search replies, retained independently of connections.
+    tasks: tasks::SharedTasks,
+    /// Operator defaults that seed service configuration: the server's own
     /// provider keys (callers supply no keys).
     pub(crate) base_env: Arc<HashMap<String, String>>,
     /// Allowed `Origin` values; `None` means no allowlist configured (allow).
@@ -138,9 +149,73 @@ pub(crate) struct AppState {
     /// Lifetime of a `/login`-issued session token.
     session_ttl: std::time::Duration,
     /// Whether the settings/config frontend (`GET /`, `/api/config`) and the
-    /// per-request `config.toml` read are enabled (`NOVA_CONFIG_UI`). Off by
-    /// default: no frontend routes, no per-request disk I/O.
+    /// throttled `config.toml` checks are enabled (`NOVA_CONFIG_UI`). Off by
+    /// default: no frontend routes or request-triggered disk I/O.
     config_ui: bool,
+}
+
+struct CachedService {
+    config: Config,
+    service: SearchService,
+    checked_at: std::time::Instant,
+}
+
+impl AppState {
+    /// A cheap clone on the hot path. With the UI enabled, check disk at most
+    /// once a second; a successful settings write forces an immediate refresh.
+    pub(crate) async fn search_service(
+        &self,
+        force_reload: bool,
+    ) -> crate::error::Result<SearchService> {
+        if !force_reload {
+            if let Some(cached) = self.service.read().await.as_ref() {
+                if !self.config_ui || cached.checked_at.elapsed().as_secs() < 1 {
+                    return Ok(cached.service.clone());
+                }
+            }
+        }
+
+        let _reload = self.service_reload.lock().await;
+        // Another request may have refreshed while this one waited.
+        if !force_reload {
+            if let Some(cached) = self.service.read().await.as_ref() {
+                if !self.config_ui || cached.checked_at.elapsed().as_secs() < 1 {
+                    return Ok(cached.service.clone());
+                }
+            }
+        }
+
+        let env = self.base_env.clone();
+        let read_file = self.config_ui;
+        let config = if read_file {
+            tokio::task::spawn_blocking(move || request_config(&env, true))
+                .await
+                .map_err(|err| {
+                    NovaVeilSearchError::Provider(format!("config reload failed: {err}"))
+                })?
+        } else {
+            request_config(&env, false)
+        };
+
+        {
+            let mut snapshot = self.service.write().await;
+            if let Some(cached) = snapshot.as_mut() {
+                if cached.config == config {
+                    cached.checked_at = std::time::Instant::now();
+                    return Ok(cached.service.clone());
+                }
+            }
+        }
+
+        let clients = crate::providers::http::HttpClients::from_config(&config, true);
+        let service = SearchService::for_request(clients, self.cache.clone(), config.clone())?;
+        *self.service.write().await = Some(CachedService {
+            config,
+            service: service.clone(),
+            checked_at: std::time::Instant::now(),
+        });
+        Ok(service)
+    }
 }
 
 /// In-memory store of login-issued session tokens with sliding expiry.
@@ -198,39 +273,31 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     // here too: the shared clients' proxies and `{account}` overrides must be
     // resolved against the keys the requests will actually run on, so keys or
     // NOVA_PROXY_* living only in config.toml still produce per-key clients.
-    // (Runtime edits via PUT /api/config take effect on the next restart.)
+    // API edits reload the service and its proxy clients before returning.
     let operator_cfg = if env_is_true(&base_env, CONFIG_UI_ENV) {
         Config::load_from(base_env.clone())
     } else {
         Config::from_env_map(base_env.clone())
     };
     // Fail before binding on a bad GROK_SEARCH_SOURCE_PROVIDERS: the chain is
-    // operator-fixed, and deferring the error to per-request service
+    // operator-managed, and deferring the error to tool-time service
     // construction would leave a listener up that rejects every call.
     crate::service::validate_source_providers(&operator_cfg)?;
     // Restricted clients: reject redirects to non-public IP-literal targets.
     // One per proxy category (keyed / keyless / grok), each honoring the
     // operator's NOVA_PROXY_* settings. `{account}` placeholders in any of the
     // three resolve per provider key.
-    let keyed_keys: &[(&'static str, Option<&str>)] = &[
-        ("tavily", operator_cfg.tavily_api_key.as_deref()),
-        ("exa", operator_cfg.exa_api_key.as_deref()),
-        ("tinyfish", operator_cfg.tinyfish_api_key.as_deref()),
-        ("firecrawl", operator_cfg.firecrawl_api_key.as_deref()),
-    ];
-    let grok_key = operator_cfg
-        .grok_api_key
-        .as_deref()
-        .or(operator_cfg.openai_compatible_api_key.as_deref());
-    let clients = crate::providers::http::HttpClients::build_restricted(
-        operator_cfg.timeout,
-        operator_cfg.proxy_key.as_deref(),
-        operator_cfg.proxy_keyless.as_deref(),
-        operator_cfg.proxy_grok.as_deref(),
-        keyed_keys,
-        grok_key,
-    );
+    let clients = crate::providers::http::HttpClients::from_config(&operator_cfg, true);
     let cache = Arc::new(Mutex::new(SourceCache::new(operator_cfg.cache_size)));
+    // Keep the settings UI available when upstream credentials are incomplete;
+    // tool calls still report the construction error until configuration is fixed.
+    let initial_service = SearchService::for_request(clients, cache.clone(), operator_cfg.clone())
+        .ok()
+        .map(|service| CachedService {
+            config: operator_cfg,
+            service,
+            checked_at: std::time::Instant::now(),
+        });
     let allowed_origins = parse_allowed_origins(&base_env);
 
     // Auth is mandatory: the bring-your-own-key mode is gone, so the master
@@ -269,8 +336,11 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     let config_ui_enabled = env_is_true(&base_env, CONFIG_UI_ENV);
 
     let state = AppState {
-        clients,
+        service: Arc::new(RwLock::new(initial_service)),
+        service_reload: Arc::new(Mutex::new(())),
+        config_write_lock: Arc::new(Mutex::new(())),
         cache,
+        tasks: tasks::new_store(),
         base_env: Arc::new(request_base),
         allowed_origins: Arc::new(allowed_origins),
         limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
@@ -287,11 +357,11 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     // held for /mcp), so no DefaultBodyLimit layer is needed.
     let mut app = Router::new()
         .route("/mcp", post(mcp_post))
+        .route("/mcp/tasks/{task_id}", get(search_task_get))
         .route("/messages", post(messages_post))
         .route("/login", post(login));
     // The settings/config frontend is opt-in (`NOVA_CONFIG_UI`): off by default
-    // it registers no frontend routes and triggers no per-request config.toml
-    // read — the process is a pure backend (MCP + login auth) with no overhead.
+    // it registers no frontend routes and triggers no config.toml checks.
     if config_ui_enabled {
         app = app.route("/", get(crate::web::serve_index)).route(
             "/api/config",
@@ -318,7 +388,7 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
     eprintln!(
         "nova-veil-search: settings/config frontend {}",
         if config_ui_enabled {
-            "enabled at GET / + /api/config (NOVA_CONFIG_UI); per-request config.toml reads active"
+            "enabled at GET / + /api/config (NOVA_CONFIG_UI); config checks throttled to once a second"
         } else {
             "disabled (set NOVA_CONFIG_UI=true to enable GET / + /api/config)"
         }
@@ -414,15 +484,12 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
         }
     }
 
-    // 4. Derive a per-request config from operator defaults (the server's own
-    //    keys) and build a request-scoped, fully-credentialed service. Missing
-    //    required key -> 401 (fail-closed); OAuth -> 400.
-    let config = request_config(&state.base_env, state.config_ui);
-    let service =
-        match SearchService::for_request(state.clients.clone(), state.cache.clone(), config) {
-            Ok(service) => service,
-            Err(err) => return for_request_error(id.clone(), err),
-        };
+    // 4. Reuse the operator's service, refreshing changed config when due.
+    //    Missing required key -> 401 (fail-closed); OAuth -> 400.
+    let service = match state.search_service(false).await {
+        Ok(service) => service,
+        Err(err) => return for_request_error(id.clone(), err),
+    };
 
     // 5. Clamp abusable numeric args (DoS) — HTTP path only; stdio is untouched.
     clamp_request_args(&mut request);
@@ -450,7 +517,49 @@ async fn mcp_post(State(state): State<AppState>, request: axum::extract::Request
         }
     }
 
-    // 7. Dispatch through the shared, transport-agnostic handler. A request
+    // Searches run independently of the response connection. Existing clients
+    // still receive the same JSON-RPC reply; opt-in async clients can poll.
+    if request.get("id").is_some()
+        && request.get("method").and_then(Value::as_str) == Some("tools/call")
+        && request.pointer("/params/name").and_then(Value::as_str) == Some("web_search")
+    {
+        let key = match idempotency_key(&headers) {
+            Ok(key) => key,
+            Err(message) => return json_rpc_error(StatusCode::BAD_REQUEST, id, -32602, message),
+        };
+        let identity = serde_json::json!({ "endpoint": "mcp", "request": request });
+        let failure = TaskResult::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_response(id, -32603, "search task failed".to_string()),
+        );
+        let work_failure = failure.clone();
+        let task = tasks::start(
+            state.tasks.clone(),
+            bearer_token(&headers).unwrap_or_default(),
+            &identity,
+            key,
+            permit,
+            async move {
+                match handle_message(&service, request).await {
+                    Some(reply) => TaskResult::new(StatusCode::OK, reply),
+                    None => work_failure,
+                }
+            },
+            failure,
+        )
+        .await;
+        return match task {
+            Ok(task) => search_task_response(state.tasks.clone(), task, &headers, true).await,
+            Err((status, message)) => json_rpc_error(
+                status,
+                identity["request"]["id"].clone(),
+                -32600,
+                message.to_string(),
+            ),
+        };
+    }
+
+    // 7. Dispatch other methods through the shared handler. A request
     //    (has an `id`) from an SSE-accepting client is streamed: the response
     //    starts immediately with a heartbeat, so a slow search can never leave
     //    the connection idle long enough for Cloudflare to 524 it (the final
@@ -602,7 +711,7 @@ fn anthropic_error(status: StatusCode, message: String) -> Response {
 /// provider never speaks SSE), so it stays separate from the /mcp streaming path.
 async fn messages_post(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     // Concurrency cap first, exactly like /mcp.
-    let _permit = match state.limiter.clone().try_acquire_owned() {
+    let permit = match state.limiter.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return (StatusCode::TOO_MANY_REQUESTS, "server at capacity").into_response(),
     };
@@ -618,9 +727,14 @@ async fn messages_post(State(state): State<AppState>, request: axum::extract::Re
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     });
-    let authorized = presented.is_some_and(|value| constant_time_eq(&value, &state.api_token));
+    let authorized = presented
+        .as_deref()
+        .is_some_and(|value| constant_time_eq(value, &state.api_token));
     if !authorized {
         return unauthorized_response();
+    }
+    if !origin_allowed(&headers, &state.allowed_origins) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
     let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
@@ -642,19 +756,17 @@ async fn messages_post(State(state): State<AppState>, request: axum::extract::Re
         );
     };
 
-    // Reuse the per-request config + service exactly as /mcp does (server keys).
-    let config = request_config(&state.base_env, state.config_ui);
-    let service =
-        match SearchService::for_request(state.clients.clone(), state.cache.clone(), config) {
-            Ok(service) => service,
-            Err(error) => {
-                let status = match &error {
-                    NovaVeilSearchError::MissingConfig(_) => StatusCode::UNAUTHORIZED,
-                    _ => StatusCode::BAD_REQUEST,
-                };
-                return anthropic_error(status, error.to_string());
-            }
-        };
+    // Share providers, key rotation and query cache with /mcp.
+    let service = match state.search_service(false).await {
+        Ok(service) => service,
+        Err(error) => {
+            let status = match &error {
+                NovaVeilSearchError::MissingConfig(_) => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            return anthropic_error(status, error.to_string());
+        }
+    };
 
     let input = WebSearchInput {
         query,
@@ -664,14 +776,256 @@ async fn messages_post(State(state): State<AppState>, request: axum::extract::Re
         response_format: Some("concise".to_string()),
         ..WebSearchInput::default()
     };
-    let output = match service.web_search(input).await {
-        Ok(output) => output,
-        Err(error) => {
-            return anthropic_error(StatusCode::BAD_GATEWAY, error.to_string());
+    let key = match idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(message) => return anthropic_error(StatusCode::BAD_REQUEST, message),
+    };
+    let identity = serde_json::json!({ "endpoint": "messages", "request": body });
+    let task = tasks::start(
+        state.tasks.clone(),
+        presented.as_deref().unwrap_or_default(),
+        &identity,
+        key,
+        permit,
+        async move {
+            match service.web_search(input).await {
+                Ok(output) => TaskResult::new(StatusCode::OK, messages_response(&output)),
+                Err(error) => messages_task_error(StatusCode::BAD_GATEWAY, error.to_string()),
+            }
+        },
+        messages_task_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "search task failed".to_string(),
+        ),
+    )
+    .await;
+    match task {
+        Ok(task) => search_task_response(state.tasks.clone(), task, &headers, false).await,
+        Err((status, message)) => anthropic_error(status, message.to_string()),
+    }
+}
+
+fn messages_task_error(status: StatusCode, message: String) -> TaskResult {
+    TaskResult::new(
+        status,
+        serde_json::json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": message },
+        }),
+    )
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Ok(key)
+            if !key.trim().is_empty()
+                && key.len() <= 128
+                && key.bytes().all(|byte| (b' '..=b'~').contains(&byte)) =>
+        {
+            Ok(Some(key.to_string()))
+        }
+        _ => Err("Idempotency-Key must contain 1 to 128 ASCII characters".to_string()),
+    }
+}
+
+fn wants_async(headers: &HeaderMap) -> bool {
+    headers.get_all("prefer").iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|preference| {
+                preference
+                    .split(';')
+                    .next()
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("respond-async"))
+            })
+        })
+    })
+}
+
+fn task_headers(mut response: Response, id: &str, status: &'static str) -> Response {
+    let headers = response.headers_mut();
+    if let Ok(value) = axum::http::HeaderValue::from_str(id) {
+        headers.insert("x-nova-task-id", value);
+    }
+    headers.insert(
+        "x-nova-task-status",
+        axum::http::HeaderValue::from_static(status),
+    );
+    headers.insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn pending_task_response(id: &str) -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "task_id": id, "status": "running" })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("2"));
+    task_headers(response, id, "running")
+}
+
+/// Mark delivery only after every body chunk has been yielded, starting the
+/// five-minute replay window. An unfinished body leaves the deadline unchanged.
+/// This is server-side completion, not an application-level acknowledgment.
+fn task_body_with_delivery<T>(
+    store: tasks::SharedTasks,
+    id: &str,
+    stream: impl Stream<Item = Result<T, Infallible>> + Send + 'static,
+) -> axum::body::Body
+where
+    T: Into<axum::body::Bytes> + Send + 'static,
+{
+    let delivery = tokio_stream::once((store, id.to_string())).then(|(store, id)| async move {
+        store.lock().await.mark_delivered(&id);
+        Ok(axum::body::Bytes::new())
+    });
+    axum::body::Body::from_stream(stream.map(|chunk| chunk.map(Into::into)).chain(delivery))
+}
+
+fn completed_task_response(store: tasks::SharedTasks, id: &str, result: TaskResult) -> Response {
+    let status = if result.failed { "failed" } else { "completed" };
+    let mut response = Response::new(task_body_with_delivery(
+        store,
+        id,
+        tokio_stream::once(Ok(result.body)),
+    ));
+    *response.status_mut() = result.status;
+    response.headers_mut().insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    task_headers(response, id, status)
+}
+
+async fn search_task_response(
+    store: tasks::SharedTasks,
+    mut task: TaskHandle,
+    headers: &HeaderMap,
+    mcp: bool,
+) -> Response {
+    let mut response = if wants_async(headers) {
+        let mut response = match task.result() {
+            Some(result) => completed_task_response(store, &task.id, result),
+            None => pending_task_response(&task.id),
+        };
+        response.headers_mut().insert(
+            "preference-applied",
+            axum::http::HeaderValue::from_static("respond-async"),
+        );
+        response
+    } else if mcp && wants_sse(headers) {
+        return search_task_sse(store, task);
+    } else {
+        match task.wait().await {
+            Some(result) => completed_task_response(store, &task.id, result),
+            None => task_headers(
+                (StatusCode::INTERNAL_SERVER_ERROR, "search task unavailable").into_response(),
+                &task.id,
+                "failed",
+            ),
         }
     };
+    // Relative to POST /mcp or /messages, retaining any reverse-proxy prefix.
+    if let Ok(location) = axum::http::HeaderValue::from_str(&format!("mcp/tasks/{}", task.id)) {
+        response.headers_mut().insert("location", location);
+    }
+    response
+}
 
-    (StatusCode::OK, Json(messages_response(&output))).into_response()
+/// Polling bypasses the search semaphore so results remain accessible when
+/// all worker slots are occupied. Authenticate every poll, including ownership.
+async fn search_task_get(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let token = bearer_token(&headers).or_else(|| header_str(&headers, "x-api-key").map(str::trim));
+    let authorized = if bearer_token(&headers).is_some() {
+        authorize(&headers, &state).await
+    } else {
+        token.is_some_and(|token| constant_time_eq(token, &state.api_token))
+    };
+    if !authorized {
+        return unauthorized_response();
+    }
+    if !origin_allowed(&headers, &state.allowed_origins) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    let task = state
+        .tasks
+        .lock()
+        .await
+        .get(&task_id, token.unwrap_or_default());
+    match task {
+        Some(task) => match task.result() {
+            Some(result) => completed_task_response(state.tasks.clone(), &task.id, result),
+            None => pending_task_response(&task.id),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            [("cache-control", "no-store")],
+            Json(serde_json::json!({ "error": "search task not found or expired" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Only this subscriber ends on disconnect; the registered search continues.
+fn search_task_sse(store: tasks::SharedTasks, mut task: TaskHandle) -> Response {
+    let id = task.id.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(8);
+    tokio::spawn(async move {
+        if tx.send(Ok(SSE_HEARTBEAT.to_vec())).await.is_err() {
+            return;
+        }
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SSE_KEEPALIVE_SECONDS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let result = task.wait();
+        tokio::pin!(result);
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = interval.tick() => {
+                    if tx.send(Ok(SSE_HEARTBEAT.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                result = &mut result => {
+                    if let Some(result) = result {
+                        let mut frame = Vec::with_capacity(result.body.len() + 24);
+                        frame.extend_from_slice(b"event: message\ndata: ");
+                        frame.extend_from_slice(&result.body);
+                        frame.extend_from_slice(b"\n\n");
+                        let _ = tx.send(Ok(frame)).await;
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    let mut response = task_headers(
+        sse_headers(Response::new(task_body_with_delivery(
+            store,
+            &id,
+            ReceiverStream::new(rx),
+        ))),
+        &id,
+        "running",
+    );
+    if let Ok(location) = axum::http::HeaderValue::from_str(&format!("mcp/tasks/{id}")) {
+        response.headers_mut().insert("location", location);
+    }
+    response
 }
 
 /// Whether the client accepts an SSE stream (Streamable HTTP streaming mode).
@@ -692,8 +1046,8 @@ fn sse_response(response: &Value) -> Response {
 }
 
 /// Build a streaming SSE response that keeps the connection warm while a tool
-/// call runs, then ends on the same `message` frame as [`sse_response`]. The
-/// search runs on a spawned task; heartbeat comment frames are written once
+/// call other than web_search runs, then ends on the same `message` frame as
+/// [`sse_response`]. Heartbeat comment frames are written once
 /// immediately and then every [`SSE_KEEPALIVE_SECONDS`], so the wire never sits
 /// silent — the exact failure mode Cloudflare turns into a 524.
 fn sse_stream_response(
@@ -714,7 +1068,10 @@ fn sse_stream_response(
             return; // client gone before we even started
         }
 
-        let mut handle = tokio::spawn(async move { handle_message(&service, request).await });
+        // Poll the handler in this task: dropping it on disconnect cancels the
+        // upstream futures and keeps the concurrency permit tied to real work.
+        let work = handle_message(&service, request);
+        tokio::pin!(work);
 
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SSE_KEEPALIVE_SECONDS));
@@ -725,16 +1082,14 @@ fn sse_stream_response(
 
         loop {
             tokio::select! {
+                _ = tx.closed() => break,
                 _ = interval.tick() => {
                     if tx.send(Ok(SSE_HEARTBEAT.to_vec())).await.is_err() {
                         break; // client disconnected mid-search
                     }
                 }
-                result = &mut handle => {
-                    // `Ok(None)` = a notification (unreachable here: the caller
-                    // only streams requests with an `id`); `Err` = the handler
-                    // task panicked. Either way just end.
-                    if let Ok(Some(response)) = result {
+                result = &mut work => {
+                    if let Some(response) = result {
                         let _ = tx.send(Ok(sse_message_frame(&response))).await;
                     }
                     break;
@@ -920,21 +1275,21 @@ fn clamp_u64(args: &mut serde_json::Map<String, Value>, key: &str, max: u64) {
 }
 
 /// Like [`clamp_u64`], but also enforces `max` when the argument is absent or
-/// non-integer — so a caller cannot bypass the cap by omitting it.
+/// non-integer or zero (unlimited) — so callers cannot bypass the cap.
 fn cap_u64(args: &mut serde_json::Map<String, Value>, key: &str, max: u64) {
     match args.get(key).and_then(Value::as_u64) {
-        Some(value) if value <= max => {}
+        Some(value) if value > 0 && value <= max => {}
         _ => {
             args.insert(key.to_string(), Value::from(max));
         }
     }
 }
 
-/// Build a per-request [`Config`] from the server's own environment; keys never
+/// Build a service [`Config`] from the server's own environment; keys never
 /// come from request headers. With `read_file` (settings frontend enabled via
 /// `NOVA_CONFIG_UI`) the full precedence chain (env > config.toml > defaults)
-/// applies, so persisted `config.toml` edits take effect on the next request
-/// without a restart. Otherwise env-only — the default, zero per-request disk I/O.
+/// applies. The service cache controls the reload interval and forces a check
+/// after API writes. Otherwise configuration is env-only.
 fn request_config(base_env: &HashMap<String, String>, read_file: bool) -> Config {
     if read_file {
         Config::load_from(base_env.clone())
@@ -1387,6 +1742,267 @@ mod tests {
         )])));
         assert!(!wants_sse(&headers(&[("Accept", "application/json")])));
         assert!(!wants_sse(&headers(&[])));
+    }
+
+    #[tokio::test]
+    async fn async_and_sse_search_disconnects_leave_a_pollable_reply() {
+        for (request_headers, expected_status) in [
+            (
+                headers(&[("Accept", "text/event-stream"), ("Prefer", "respond-async")]),
+                StatusCode::ACCEPTED,
+            ),
+            (headers(&[("Accept", "text/event-stream")]), StatusCode::OK),
+        ] {
+            let store = tasks::new_store();
+            let semaphore = Arc::new(Semaphore::new(1));
+            let (finish, gate) = tokio::sync::oneshot::channel();
+            let expected = TaskResult::new(
+                StatusCode::OK,
+                serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "answer": "done" } }),
+            );
+            let output = expected.clone();
+            let task = tasks::start(
+                store.clone(),
+                "owner",
+                &serde_json::json!({ "query": "test" }),
+                None,
+                semaphore.clone().try_acquire_owned().unwrap(),
+                async move {
+                    gate.await.unwrap();
+                    output
+                },
+                messages_task_error(StatusCode::INTERNAL_SERVER_ERROR, "failed".to_string()),
+            )
+            .await
+            .unwrap();
+            let id = task.id.clone();
+            let response = search_task_response(store.clone(), task, &request_headers, true).await;
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()["x-nova-task-id"], id.as_str());
+            let location = response.headers()["location"].to_str().unwrap();
+            let resolved = url::Url::parse("https://example.com/nova-veil-search/mcp")
+                .unwrap()
+                .join(location)
+                .unwrap();
+            assert_eq!(resolved.path(), format!("/nova-veil-search/mcp/tasks/{id}"));
+            drop(response);
+            assert_eq!(semaphore.available_permits(), 0);
+            finish.send(()).unwrap();
+            let permit =
+                tokio::time::timeout(std::time::Duration::from_secs(1), semaphore.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            drop(permit);
+            let result = store
+                .lock()
+                .await
+                .get(&id, "owner")
+                .unwrap()
+                .result()
+                .unwrap();
+            let reply = completed_task_response(store.clone(), &id, result);
+            assert_eq!(reply.headers()["x-nova-task-status"], "completed");
+            let body = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+            assert_eq!(body, expected.body);
+            let cached = store
+                .lock()
+                .await
+                .get(&id, "owner")
+                .unwrap()
+                .result()
+                .unwrap();
+            assert_eq!(cached.body, expected.body);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fully_drained_search_bodies_start_a_fixed_replay_window() {
+        for (request_headers, mcp) in [
+            (headers(&[]), true),
+            (headers(&[("Accept", "text/event-stream")]), true),
+            (headers(&[("Prefer", "respond-async")]), true),
+            (headers(&[]), false),
+        ] {
+            for status in [StatusCode::OK, StatusCode::BAD_GATEWAY] {
+                let store = tasks::new_store();
+                let expected = if status.is_success() {
+                    TaskResult::new(status, serde_json::json!({ "result": "done" }))
+                } else {
+                    messages_task_error(status, "failed".into())
+                };
+                let output = expected.clone();
+                let mut task = tasks::start(
+                    store.clone(),
+                    "owner",
+                    &serde_json::json!({}),
+                    None,
+                    Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                    async move { output },
+                    expected.clone(),
+                )
+                .await
+                .unwrap();
+                task.wait().await.unwrap();
+                let id = task.id.clone();
+
+                // An unfinished response must not start the shorter deadline.
+                let response =
+                    search_task_response(store.clone(), task, &request_headers, mcp).await;
+                assert!(store.lock().await.get(&id, "owner").is_some());
+                let mut body = response.into_body().into_data_stream();
+                assert!(body.next().await.unwrap().is_ok());
+                drop(body);
+                tokio::time::advance(std::time::Duration::from_secs(5 * 60)).await;
+                let retry = store.lock().await.get(&id, "owner").unwrap();
+                let response =
+                    search_task_response(store.clone(), retry, &request_headers, mcp).await;
+                let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                if wants_sse(&request_headers) {
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(text.contains(&format!(
+                        "event: message\ndata: {}\n\n",
+                        std::str::from_utf8(&expected.body).unwrap()
+                    )));
+                } else {
+                    assert_eq!(bytes, expected.body);
+                }
+                tokio::time::advance(std::time::Duration::from_secs(4 * 60 + 59)).await;
+                let retry = store.lock().await.get(&id, "owner").unwrap();
+                assert_eq!(retry.result().unwrap().body, expected.body);
+                let response =
+                    search_task_response(store.clone(), retry, &request_headers, mcp).await;
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
+                assert!(store.lock().await.get(&id, "owner").is_none());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reading_pending_status_does_not_start_the_replay_window() {
+        let store = tasks::new_store();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (finish, gate) = tokio::sync::oneshot::channel();
+        let task = tasks::start(
+            store.clone(),
+            "owner",
+            &serde_json::json!({}),
+            None,
+            semaphore.clone().try_acquire_owned().unwrap(),
+            async move {
+                gate.await.unwrap();
+                TaskResult::new(StatusCode::OK, serde_json::json!({ "result": "done" }))
+            },
+            messages_task_error(StatusCode::INTERNAL_SERVER_ERROR, "failed".into()),
+        )
+        .await
+        .unwrap();
+        let id = task.id.clone();
+        let response = search_task_response(
+            store.clone(),
+            task,
+            &headers(&[("Prefer", "respond-async")]),
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        finish.send(()).unwrap();
+        let _permit = semaphore.acquire().await.unwrap();
+        axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(5 * 60)).await;
+        assert!(store
+            .lock()
+            .await
+            .get(&id, "owner")
+            .unwrap()
+            .result()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn http_polls_replay_the_same_reply_and_preserve_ownership_checks() {
+        let store = tasks::new_store();
+        let expected = TaskResult::new(StatusCode::OK, serde_json::json!({ "result": "done" }));
+        let output = expected.clone();
+        let mut task = tasks::start(
+            store.clone(),
+            "master",
+            &serde_json::json!({}),
+            None,
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            async move { output },
+            expected.clone(),
+        )
+        .await
+        .unwrap();
+        task.wait().await.unwrap();
+        let id = task.id.clone();
+        drop(task);
+        let session_ttl = std::time::Duration::from_secs(60);
+        let mut sessions = SessionStore::new();
+        let other_owner = sessions.issue(session_ttl);
+        let state = AppState {
+            service: Arc::new(RwLock::new(None)),
+            service_reload: Arc::new(Mutex::new(())),
+            config_write_lock: Arc::new(Mutex::new(())),
+            cache: Arc::new(Mutex::new(SourceCache::new(1))),
+            tasks: store.clone(),
+            base_env: Arc::new(HashMap::new()),
+            allowed_origins: Arc::new(None),
+            limiter: Arc::new(Semaphore::new(0)),
+            dns_limiter: Arc::new(Semaphore::new(1)),
+            api_token: "master".into(),
+            sessions: Arc::new(Mutex::new(sessions)),
+            admin_user: "admin".into(),
+            admin_password: None,
+            session_ttl,
+            config_ui: false,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp/tasks/{id}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/mcp/tasks/{task_id}", get(search_task_get))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (token, status) in [
+            ("invalid", StatusCode::UNAUTHORIZED),
+            (other_owner.as_str(), StatusCode::NOT_FOUND),
+        ] {
+            let response = client.get(&url).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), status);
+            response.bytes().await.unwrap();
+            assert!(store.lock().await.get(&id, "master").is_some());
+        }
+        let head = client
+            .head(&url)
+            .bearer_auth("master")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(head.bytes().await.unwrap().is_empty());
+        assert!(store.lock().await.get(&id, "master").is_some());
+
+        let response = client.get(&url).bearer_auth("master").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), expected.body);
+        assert!(store.lock().await.get(&id, "master").is_some());
+        let response = client.get(&url).bearer_auth("master").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), expected.body);
+        server.abort();
     }
 
     #[tokio::test]

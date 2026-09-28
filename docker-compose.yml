@@ -27,21 +27,24 @@ services:
       NOVA_ADMIN_PASSWORD: "${NOVA_ADMIN_PASSWORD:-}"
       NOVA_SESSION_TTL_SECONDS: "${NOVA_SESSION_TTL_SECONDS:-43200}"
       # Settings/config frontend (GET / + /api/config) — opt-in, OFF by default.
-      # Uncomment to serve the embedded settings SPA. OFF = pure backend, no
-      # frontend routes, no per-request config.toml read.
-      # NOVA_CONFIG_UI: "true"
+      # Set NOVA_CONFIG_UI=true in .env to serve the embedded settings page.
+      # Config is persisted in nova_config; env values still take precedence.
+      NOVA_CONFIG_UI: "${NOVA_CONFIG_UI:-false}"
       GROK_SEARCH_API_KEY: "${GROK_SEARCH_API_KEY:-}"
-      TAVILY_API_KEY: "${TAVILY_API_KEY:-}"
+      # Leave absent when managing this key through the settings page. A bare
+      # entry passes through a configured value and omits an unresolved one.
+      TAVILY_API_KEY:
       # Optional extra source providers: uncomment and fill as needed.
-      # EXA_API_KEY: "${EXA_API_KEY:-}"
-      # FIRECRAWL_API_KEY: "${FIRECRAWL_API_KEY:-}"
-      # TINYFISH_API_KEY: "${TINYFISH_API_KEY:-}"
+      # EXA_API_KEY:
+      # SERPER_API_KEY:
+      # FIRECRAWL_API_KEY:
+      # TINYFISH_API_KEY:
       # GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       # Operator-fixed gateway/model defaults (optional).
       # GROK_SEARCH_URL: "https://api.x.ai"
       # GROK_SEARCH_MODEL: "grok-4-1-fast-reasoning"
       # ── Outbound proxy (all OFF by default; empty = direct) ────────────────
-      # NOVA_PROXY_KEY     = keyed providers  (Tavily/Exa/TinyFish/Firecrawl)
+      # NOVA_PROXY_KEY     = keyed providers  (Tavily/Exa/TinyFish/Serper/Firecrawl)
       # NOVA_PROXY_KEYLESS = keyless engines  (DuckDuckGo/Bing + specialists)
       # NOVA_PROXY_GROK    = Grok engine proxy (URL; unset = direct)
       # Schemes: http://, https://, socks5://, socks5h:// (creds supported).
@@ -54,6 +57,8 @@ services:
       # Keys are always server-side here; callers never supply their own.
     expose:
       - "8080"
+    volumes:
+      - nova_config:/var/lib/nova-veil-search
     mem_limit: 256m
     security_opt:
       - no-new-privileges:true
@@ -74,5 +79,6 @@ services:
       - caddy_config:/config
 
 volumes:
+  nova_config:
   caddy_data:
   caddy_config:

@@ -9,11 +9,15 @@
 #     --platform linux/amd64,linux/arm64 -t <registry>/nova-veil-search:deploy --push .
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates \
-    && adduser -D -H -s /sbin/nologin grokmcp
+    && adduser -D -H -s /sbin/nologin grokmcp \
+    && mkdir -p /var/lib/nova-veil-search \
+    && chown grokmcp:grokmcp /var/lib/nova-veil-search \
+    && chmod 0700 /var/lib/nova-veil-search
 # BuildKit sets TARGETPLATFORM per output platform (linux/amd64, linux/arm64, ...).
 ARG TARGETPLATFORM
 COPY dist/${TARGETPLATFORM}/nova-veil-search /usr/local/bin/nova-veil-search
 ENV GROK_MCP_BIND=0.0.0.0:8080
+ENV GROK_SEARCH_CONFIG=/var/lib/nova-veil-search/config.toml
 EXPOSE 8080
 USER grokmcp
 ENTRYPOINT ["nova-veil-search", "--http"]

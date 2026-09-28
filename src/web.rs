@@ -17,7 +17,7 @@ use axum::{
 use crate::config::{load_source_config, validate_edits, write_source_config, SourceEdits};
 use crate::http::{authorize, origin_allowed, unauthorized_response, AppState};
 
-/// Max JSON body for a config write. Nine small fields; anything larger is abuse.
+/// Bound the JSON body for a partial source-config write.
 const MAX_CONFIG_BODY_BYTES: usize = 16 * 1024;
 
 /// `GET /` — the SPA shell. Unauthenticated by design: the page contains no
@@ -40,8 +40,11 @@ pub(crate) async fn get_config(State(state): State<AppState>, headers: HeaderMap
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
 
-    let view = load_source_config(&state.base_env);
-    (StatusCode::OK, Json(view)).into_response()
+    let env = state.base_env.clone();
+    match tokio::task::spawn_blocking(move || load_source_config(&env)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(err) => config_error(format!("failed to read config: {err}")),
+    }
 }
 
 /// `PUT /api/config` — partial merge + atomic write of the editable subset.
@@ -88,14 +91,39 @@ pub(crate) async fn put_config(
             .into_response();
     }
 
-    match write_source_config(&state.base_env, &edits) {
-        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to write config: {err}")
-            })),
-        )
-            .into_response(),
+    let write_guard = state.config_write_lock.clone().lock_owned().await;
+    let env = state.base_env.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // The blocking write can outlive a disconnected HTTP handler. Keep the
+        // lock inside its task, then return it to cover activation as well.
+        let result = write_source_config(&env, &edits);
+        (result, write_guard)
+    })
+    .await;
+    match result {
+        Ok((result, _write_guard)) => match result {
+            Ok(view) => match state.search_service(true).await {
+                Ok(_) => (StatusCode::OK, Json(view)).into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("config saved, but activation failed: {err}"),
+                        "saved": true,
+                        "config": view,
+                    })),
+                )
+                    .into_response(),
+            },
+            Err(err) => config_error(format!("failed to write config: {err}")),
+        },
+        Err(err) => config_error(format!("config write task failed: {err}")),
     }
+}
+
+fn config_error(message: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }

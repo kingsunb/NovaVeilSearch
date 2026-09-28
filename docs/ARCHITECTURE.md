@@ -70,3 +70,27 @@ The binary is a stdio JSON-RPC server. It handles:
 - `tools/call`
 
 Tool responses are serialized JSON inside MCP text content for broad client compatibility.
+
+## HTTP search lifecycle
+
+HTTP requests share a `SearchService` and its provider rotation/query cache
+until configuration changes. The source cache for `get_sources` survives those
+service replacements.
+
+For `web_search` and `/messages`, `src/http/tasks.rs` registers a task and starts
+a worker independently of the response subscriber. A supervisor holds the
+concurrency permit through worker completion and publishes the complete
+serialized response (including errors) to a retained watch channel. Dropping
+an SSE or JSON response subscriber leaves the worker running under the search
+deadline. Retries with the same token and `Idempotency-Key` subscribe to the
+same task after checking the request fingerprint.
+
+`GET /mcp/tasks/{task_id}` checks authentication and ownership without taking a
+search permit. The first fully streamed JSON/SSE reply starts a five-minute
+replay window for its result, task, and idempotency record. Repeated retrieval
+returns the same reply without extending that window; an unfinished body does
+not start it. Unclaimed responses expire 30 minutes after completion, with an
+idle sweeper every 30 seconds. Tasks are bounded by 128 records / 32 MiB
+(excluding active response buffers and other caches); running records are never
+evicted. The task store survives configuration reloads but not process restarts. See
+[HTTP search tasks and polling](HTTP_SEARCH_TASKS.md) for the client contract.

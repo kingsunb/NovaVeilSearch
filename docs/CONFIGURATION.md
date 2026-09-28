@@ -61,6 +61,14 @@ Local (stdio) — the same values as `env`:
 }
 ```
 
+### HTTP search disconnects and polling
+
+HTTP search task retention and polling are always available with the HTTP
+feature, independently of the settings UI. See
+[HTTP search tasks and polling](HTTP_SEARCH_TASKS.md) for `Prefer: respond-async`,
+`Idempotency-Key`, task status, and retention limits. These headers do not
+change provider credentials or the configured search timeout.
+
 ### Settings/config frontend (opt-in, `NOVA_CONFIG_UI`)
 
 The embedded settings SPA (`GET /`) and the config read/write API (`GET/PUT

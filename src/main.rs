@@ -56,8 +56,8 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Native Streamable HTTP transport (feature `http`): opt in with `--http` /
-    // `serve`, or GROK_MCP_BIND=host:port. Credentials come only from
-    // per-request headers, so this path intentionally ignores server-side keys.
+    // `serve`, or GROK_MCP_BIND=host:port. Provider credentials come from the
+    // server configuration; clients authenticate with a bearer token.
     // stdio stays the default when neither is set — local users are unaffected.
     #[cfg(feature = "http")]
     {

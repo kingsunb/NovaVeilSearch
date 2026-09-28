@@ -366,6 +366,18 @@ Connect a client over Streamable HTTP with the `Authorization: Bearer <token>` h
 ([Quick Start](#quick-start) shows the stdio setup; the header example is [above](#self-hosting-remote-http)),
 pointing `url` at your own host (`https://<your-host>/nova-veil-search/mcp`).
 
+### Search disconnects and polling
+
+HTTP searches continue after a client disconnects and retain their complete
+reply for polling. Clients can opt into `Prefer: respond-async`, poll
+`GET /mcp/tasks/{task_id}`, and reuse an `Idempotency-Key` when retrying a POST.
+Completed replies remain available for 5 minutes after their first fully streamed
+delivery; repeated retrieval returns the same reply without extending expiry.
+Unclaimed replies expire 30 minutes after search completion. The task store is
+bounded by 128 records / 32 MiB and may evict old completed replies earlier.
+See [HTTP search tasks and polling](docs/HTTP_SEARCH_TASKS.md) for the request
+contract, authentication, and retention limits.
+
 ### Rotating a key
 
 Keys live on the server, so rotate there (update the provider key in the server environment).

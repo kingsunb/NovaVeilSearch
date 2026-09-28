@@ -553,8 +553,8 @@ pub struct SearchService {
     /// Query-result LRU cache for the supplemental source fan-out, keyed by a
     /// normalized query + filter signature. Bounded in size and per-entry age;
     /// `result_cache_ttl_seconds == 0` disables it. Behind `Arc` so
-    /// `SearchService: Clone` stays cheap; rebuilt per service so each stdio
-    /// process (and each per-request HTTP service) owns its cache lifetime.
+    /// `SearchService: Clone` stays cheap. HTTP requests share the service until
+    /// its configuration changes, preserving this cache across requests.
     query_cache: Arc<Mutex<QueryResultCache>>,
     /// Shared reqwest client for the sources pipeline (same instance handed to
     /// providers). Stored here because resolve_content needs direct GET access.
@@ -565,10 +565,10 @@ pub struct SearchService {
 }
 
 /// The credential-derived half of a [`SearchService`]: everything that must be
-/// rebuilt when the caller's keys change. [`build_providers`] constructs these
+/// rebuilt when configuration changes. [`build_providers`] constructs these
 /// from a [`Config`]; [`SearchService::new`] uses it with a process-wide config
-/// (the stdio path), and [`SearchService::with_config`] uses it per request
-/// while sharing the long-lived source cache.
+/// (the stdio path). HTTP constructs one shared service per config snapshot,
+/// preserving the long-lived session source cache across reloads.
 struct ProviderSet {
     ai: Arc<dyn AiProvider>,
     default_model: String,
@@ -579,7 +579,7 @@ struct ProviderSet {
 /// Build the credential-bearing providers for a given `config`, using the
 /// three shared clients (keyed / keyless / grok) from the proxy dispatcher.
 /// Extracted from the original `SearchService::new` body so both the
-/// process-wide (stdio) and per-request (HTTP) construction paths share one
+/// process-wide (stdio) and cached HTTP construction paths share one
 /// implementation.
 fn build_providers(
     config: &Config,
@@ -665,25 +665,7 @@ fn build_providers(
 /// paths derive their clients identically. `{account}` placeholders in any of
 /// the three proxy values resolve per provider key here.
 fn proxy_clients(config: &Config) -> crate::providers::http::HttpClients {
-    let keyed_keys: &[(&'static str, Option<&str>)] = &[
-        ("tavily", config.tavily_api_key.as_deref()),
-        ("exa", config.exa_api_key.as_deref()),
-        ("tinyfish", config.tinyfish_api_key.as_deref()),
-        ("firecrawl", config.firecrawl_api_key.as_deref()),
-        ("serper", config.serper_api_key.as_deref()),
-    ];
-    let grok_key = config
-        .grok_api_key
-        .as_deref()
-        .or(config.openai_compatible_api_key.as_deref());
-    crate::providers::http::HttpClients::build(
-        config.timeout,
-        config.proxy_key.as_deref(),
-        config.proxy_keyless.as_deref(),
-        config.proxy_grok.as_deref(),
-        keyed_keys,
-        grok_key,
-    )
+    crate::providers::http::HttpClients::from_config(config, false)
 }
 
 /// Non-reversible per-tenant namespace tag derived from the caller's primary
@@ -719,16 +701,14 @@ impl SearchService {
         Ok(Self::from_parts(config, clients.keyless, cache, providers))
     }
 
-    /// Build a request-scoped service that reuses this service's shared source
+    /// Build a replacement service that reuses this service's shared source
     /// cache, but derives every credential-bearing provider (and its proxy
-    /// routing) from `config`. The HTTP transport calls [`for_request`] directly,
-    /// passing the server's shared clients; this method instead re-derives plain
-    /// clients from `config` so a caller-supplied config can't smuggle in proxy
-    /// settings that bypass the operator's own `NOVA_PROXY_*` environment.
+    /// routing) from `config`. This helper derives plain clients; HTTP calls
+    /// [`for_request`] with restricted clients and server-managed config.
     ///
     /// OAuth is rejected here: it resolves a single on-disk identity and is
-    /// incompatible with per-request, multi-tenant credentials. HTTP callers
-    /// must pass an API key. The local stdio path keeps OAuth via [`new`].
+    /// not supported by this constructor. HTTP uses server-held API keys.
+    /// The local stdio path keeps OAuth via [`new`].
     ///
     /// [`new`]: SearchService::new
     /// [`for_request`]: SearchService::for_request
@@ -736,13 +716,10 @@ impl SearchService {
         Self::for_request(proxy_clients(&config), self.cache.clone(), config)
     }
 
-    /// Build a request-scoped service from shared state — a reused set of HTTP
-    /// clients and the process-wide source cache — plus a per-request `config`.
-    /// This is the entrypoint the HTTP transport uses: the server holds the
-    /// credentials, authenticates the request, then constructs a
-    /// fully-credentialed service per request from the server's own keys. OAuth
-    /// is rejected here (single on-disk identity is incompatible with a shared
-    /// server); a missing required key fails at construction (fail-closed).
+    /// Build an HTTP-compatible service from outbound clients, the shared
+    /// session source cache and a server-managed config snapshot. The HTTP
+    /// transport caches this service until config changes. OAuth is rejected
+    /// here; a missing required key fails at construction (fail-closed).
     pub fn for_request(
         clients: crate::providers::http::HttpClients,
         cache: Arc<Mutex<SourceCache>>,
@@ -994,7 +971,17 @@ impl SearchService {
         let speculative_count = effective_extra_sources.max(self.config.fallback_sources);
         let request = self.build_search_request(&input, &[]);
 
-        let grok_future = self.ai.search(&request);
+        // Retries share the caller's deadline instead of receiving a fresh
+        // client timeout on each attempt.
+        let grok_future = async {
+            tokio::time::timeout_at(deadline, self.ai.search(&request))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(NovaVeilSearchError::Timeout(
+                        "AI search reached the request deadline".to_string(),
+                    ))
+                })
+        };
         let speculative_future =
             self.fetch_raw_extra_sources(&input.query, speculative_count, &filters, deadline);
         let (grok_result, raw) = tokio::join!(grok_future, speculative_future);
@@ -1111,14 +1098,14 @@ impl SearchService {
                 "source fan-out disabled (extra_sources and fallback_sources are both 0)",
             )]);
         }
+        let cache_key = self.query_cache_key(query, count, filters);
+        if let Some((cached, origin)) = self.query_cache.lock().await.get(&cache_key) {
+            return RawSources::found(cached, (origin != "parallel").then_some(origin));
+        }
         if self.config.parallel_sources {
             return self
                 .fetch_raw_sources_parallel(query, count, filters, deadline)
                 .await;
-        }
-        let cache_key = self.query_cache_key(query, count, filters);
-        if let Some((cached, origin)) = self.query_cache.lock().await.get(&cache_key) {
-            return RawSources::found(cached, Some(origin));
         }
         let mut notes = Vec::new();
         for slot in self.source_slots.iter() {
@@ -1220,9 +1207,7 @@ impl SearchService {
     /// the providers' native names; the caller preserves them (via
     /// [`Config::parallel_sources`]) instead of overwriting with a
     /// `{origin}_enrichment` / `{origin}_fallback` label. The query-result
-    /// cache is also bypassed: its key does not encode the fan-out mode, and a
-    /// cached single-provider result must not masquerade as a parallel merge
-    /// (or vice versa).
+    /// cache distinguishes the fan-out mode and preserves native source labels.
     async fn fetch_raw_sources_parallel(
         &self,
         query: &str,
@@ -1293,10 +1278,12 @@ impl SearchService {
         // in chain order (not completion order) below.
         let mut per_provider: std::collections::HashMap<&'static str, Vec<Source>> =
             std::collections::HashMap::new();
+        let mut cacheable = true;
         while let Some(joined) = set.join_next().await {
             let (name, attempt) = match joined {
                 Ok(pair) => pair,
                 Err(err) => {
+                    cacheable = false;
                     notes.push(SourceNote::broken(format!(
                         "source fan-out: a provider task panicked or was cancelled: {err}"
                     )));
@@ -1308,12 +1295,23 @@ impl SearchService {
                     Ok(usable) => {
                         per_provider.insert(name, usable);
                     }
-                    Err(note) => notes.push(note),
+                    Err(note) => {
+                        if note.kind == NoteKind::Broken {
+                            cacheable = false;
+                        }
+                        notes.push(note);
+                    }
                 },
-                Ok(Err(err)) => notes.push(SourceNote::broken(format!("{name}: {err}"))),
-                Err(_elapsed) => notes.push(SourceNote::broken(format!(
-                    "{name}: timed out (request deadline reached)"
-                ))),
+                Ok(Err(err)) => {
+                    cacheable = false;
+                    notes.push(SourceNote::broken(format!("{name}: {err}")));
+                }
+                Err(_elapsed) => {
+                    cacheable = false;
+                    notes.push(SourceNote::broken(format!(
+                        "{name}: timed out (request deadline reached)"
+                    )));
+                }
             }
         }
 
@@ -1356,6 +1354,15 @@ impl SearchService {
         if merged.is_empty() {
             RawSources::empty(notes)
         } else {
+            // Missing/disabled providers are fixed by this service's config;
+            // transient failures should be retried instead of cached.
+            if cacheable {
+                self.query_cache.lock().await.set(
+                    self.query_cache_key(query, count, filters),
+                    merged.clone(),
+                    "parallel",
+                );
+            }
             RawSources {
                 sources: merged,
                 origin: None,
@@ -1374,12 +1381,13 @@ impl SearchService {
         let mut exclude = filters.exclude_domains.clone();
         exclude.sort();
         format!(
-            "q={}\x1finc={}\x1fexc={}\x1fdays={}\x1fn={}",
+            "q={}\x1finc={}\x1fexc={}\x1fdays={}\x1fn={}\x1fparallel={}",
             query.trim().to_lowercase(),
             include.join(","),
             exclude.join(","),
             filters.recency_days.unwrap_or(0),
             count,
+            self.config.parallel_sources,
         )
     }
 
@@ -1658,7 +1666,13 @@ impl SearchService {
                     })
             })
             .ok_or(NovaVeilSearchError::MissingConfig("TAVILY_API_KEY"))?;
-        provider.map(url, max_results).await
+        tokio::time::timeout(self.config.timeout, provider.map(url, max_results))
+            .await
+            .unwrap_or_else(|_| {
+                Err(NovaVeilSearchError::Timeout(
+                    "web_map reached the request deadline".to_string(),
+                ))
+            })
     }
 
     /// Runtime diagnostics with live connectivity probes against each configured backend.

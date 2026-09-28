@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# nova-veil-search — public multi-tenant Streamable HTTP MCP server.
-# The image holds NO credentials: each request carries the caller's own keys as
-# headers (X-Grok-Api-Key / X-Tavily-Api-Key / X-Firecrawl-Api-Key).
+# nova-veil-search — Streamable HTTP MCP server with server-held credentials.
+# Configure provider keys through the environment or the optional settings UI.
 
 # ---- build stage ----------------------------------------------------------
 FROM rust:1-bookworm AS builder
@@ -17,10 +16,12 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --shell /usr/sbin/nologin grokmcp
+    && useradd --system --user-group --no-create-home --shell /usr/sbin/nologin grokmcp \
+    && install -d -m 0700 -o grokmcp -g grokmcp /var/lib/nova-veil-search
 COPY --from=builder /nova-veil-search /usr/local/bin/nova-veil-search
 # Bind all interfaces inside the container; a reverse proxy terminates TLS.
 ENV GROK_MCP_BIND=0.0.0.0:8080
+ENV GROK_SEARCH_CONFIG=/var/lib/nova-veil-search/config.toml
 EXPOSE 8080
 USER grokmcp
 ENTRYPOINT ["nova-veil-search", "--http"]

@@ -119,6 +119,7 @@ jobs:
         run: |
           cargo build --release --target x86_64-apple-darwin --locked
           cargo build --release --target aarch64-apple-darwin --locked
+          mkdir -p target/release
           lipo -create -output target/release/${{ matrix.artifact_name }} \
             target/x86_64-apple-darwin/release/${{ matrix.artifact_name }} \
             target/aarch64-apple-darwin/release/${{ matrix.artifact_name }}

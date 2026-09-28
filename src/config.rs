@@ -555,7 +555,10 @@ impl Config {
             fetch_max_chars: optional_positive_usize(&map, "GROK_SEARCH_FETCH_MAX_CHARS"),
             cache_size: usize_value(&map, "GROK_SEARCH_CACHE_SIZE", 256),
             result_cache_size: usize_value(&map, "GROK_SEARCH_RESULT_CACHE_SIZE", 50),
-            result_cache_ttl_seconds: u64_value(&map, "GROK_SEARCH_RESULT_CACHE_TTL_SECONDS", 300),
+            result_cache_ttl_seconds: map
+                .get("GROK_SEARCH_RESULT_CACHE_TTL_SECONDS")
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(300),
             timeout: Duration::from_secs(u64_value(&map, "GROK_SEARCH_TIMEOUT_SECONDS", 60)),
             parallel_sources: bool_value(&map, "GROK_SEARCH_PARALLEL_SOURCES", false),
             openai_compatible_api_url: map
@@ -632,15 +635,8 @@ impl Config {
     }
 }
 
-/// The five search sources the web settings editor manages (key'd providers
-/// with editable `*_enabled` / `*_api_key` toggles). Keyless engines
-/// (DuckDuckGo, Bing) are configured only via `source_providers` / env and are
-/// intentionally absent from this map so the editor doesn't render toggles for
-/// providers that have no key to manage.
-const ALLOWED_SOURCE_NAMES: [&str; 5] = ["tavily", "exa", "tinyfish", "firecrawl", "serper"];
-
 /// Every provider name `source_providers` may legitimately reference, including
-/// the keyless engines. Used for validation and the error's valid-name list.
+/// the keyless engines, in the built-in chain order.
 const KNOWN_SOURCE_NAMES: [&str; 7] = [
     "tavily",
     "exa",
@@ -669,6 +665,8 @@ pub enum KeyStatus {
 pub struct SourceView {
     pub enabled: bool,
     pub api_key: KeyStatus,
+    /// Whether this provider can run without a key in the current configuration.
+    pub keyless: bool,
 }
 
 /// Effective, masked view of the whole editable search-source configuration.
@@ -678,6 +676,8 @@ pub struct SourceView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourcesView {
     pub source_providers: Vec<String>,
+    pub default_source_providers: Vec<String>,
+    pub parallel_sources: bool,
     pub sources: std::collections::BTreeMap<String, SourceView>,
     pub env_overrides: std::collections::BTreeMap<String, bool>,
     pub config_file: Option<String>,
@@ -700,6 +700,8 @@ pub struct SourceEdits {
     pub exa_api_key: Option<String>,
     pub serper_enabled: Option<bool>,
     pub serper_api_key: Option<String>,
+    pub duckduckgo_enabled: Option<bool>,
+    pub bing_enabled: Option<bool>,
     pub source_providers: Option<Vec<String>>,
 }
 
@@ -714,30 +716,46 @@ pub struct FieldError {
 pub fn load_source_config(env: &HashMap<String, String>) -> SourcesView {
     let cfg = Config::load_from(env.clone());
     let mut sources = std::collections::BTreeMap::new();
-    for name in ALLOWED_SOURCE_NAMES {
-        let (enabled, api_key) = match name {
-            "tavily" => (cfg.tavily_enabled, &cfg.tavily_api_key),
-            "firecrawl" => (cfg.firecrawl_enabled, &cfg.firecrawl_api_key),
-            "tinyfish" => (cfg.tinyfish_enabled, &cfg.tinyfish_api_key),
-            "exa" => (cfg.exa_enabled, &cfg.exa_api_key),
-            "serper" => (cfg.serper_enabled, &cfg.serper_api_key),
-            _ => unreachable!("ALLOWED_SOURCE_NAMES is exhaustive"),
+    for name in KNOWN_SOURCE_NAMES {
+        let (enabled, has_key, keyless) = match name {
+            "tavily" => (
+                cfg.tavily_enabled,
+                cfg.tavily_api_key.is_some(),
+                cfg.tavily_keyless,
+            ),
+            "firecrawl" => (
+                cfg.firecrawl_enabled,
+                cfg.firecrawl_api_key.is_some(),
+                cfg.firecrawl_keyless,
+            ),
+            "tinyfish" => (cfg.tinyfish_enabled, cfg.tinyfish_api_key.is_some(), false),
+            "exa" => (cfg.exa_enabled, cfg.exa_api_key.is_some(), cfg.exa_keyless),
+            "serper" => (cfg.serper_enabled, cfg.serper_api_key.is_some(), false),
+            "duckduckgo" => (cfg.duckduckgo_enabled, false, true),
+            "bing" => (cfg.bing_enabled, false, true),
+            _ => unreachable!("KNOWN_SOURCE_NAMES is exhaustive"),
         };
         sources.insert(
             name.to_string(),
             SourceView {
                 enabled,
-                api_key: if api_key.is_some() {
+                api_key: if has_key {
                     KeyStatus::Set
                 } else {
                     KeyStatus::Unset
                 },
+                keyless,
             },
         );
     }
 
     SourcesView {
         source_providers: cfg.source_providers.clone(),
+        default_source_providers: KNOWN_SOURCE_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        parallel_sources: cfg.parallel_sources,
         sources,
         env_overrides: env_override_map(env),
         config_file: cfg
@@ -836,6 +854,8 @@ fn env_override_map(env: &HashMap<String, String>) -> std::collections::BTreeMap
         ("exa_api_key", "EXA_API_KEY"),
         ("serper_enabled", "SERPER_ENABLED"),
         ("serper_api_key", "SERPER_API_KEY"),
+        ("duckduckgo_enabled", "DUCKDUCKGO_ENABLED"),
+        ("bing_enabled", "BING_ENABLED"),
         ("source_providers", "GROK_SEARCH_SOURCE_PROVIDERS"),
     ]
     .into_iter()
@@ -846,6 +866,14 @@ fn env_override_map(env: &HashMap<String, String>) -> std::collections::BTreeMap
 /// Apply only the present (`Some`) edit fields onto a `DocumentMut`. Comments,
 /// key order, and every unmanaged key are preserved verbatim.
 fn apply_edits(doc: &mut toml_edit::DocumentMut, edits: &SourceEdits) {
+    for (key, enabled) in [
+        ("duckduckgo_enabled", edits.duckduckgo_enabled),
+        ("bing_enabled", edits.bing_enabled),
+    ] {
+        if let Some(value) = enabled {
+            doc[key] = toml_edit::value(value);
+        }
+    }
     for (base, enabled, api_key) in [
         (
             "tavily",
